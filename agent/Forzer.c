@@ -106,10 +106,9 @@ typedef struct {
     int active;            /* 1 while a session is live */
     char id[64];           /* session id from the viewer */
     char to[64];           /* viewer id to route data back to */
-    HANDLE hInWrite;       /* child stdin write end (agent->child) */
-    HANDLE hOutRead;       /* child stdout/stderr read end */
-    HANDLE hProc;          /* child process handle */
-    HANDLE hThread;        /* reader thread */
+    HANDLE hInWrite;       /* input pipe write end (agent->shell) */
+    HANDLE hInRead;        /* input pipe read end (shell reads lines here) */
+    HANDLE hThread;        /* input/executor thread */
     CRITICAL_SECTION lock;
     /* output ring buffer: reader thread appends, main loop drains+sends */
     unsigned char outbuf[32768];
@@ -711,59 +710,48 @@ static void term_send(const char *kind, const char *data, int len, int rc) {
     tr_send(msg, (int)strlen(msg));
 }
 
+static char g_term_line[8192];
+static int g_term_linelen = 0;
+
+/* Execute buffered terminal input. A bare cmd.exe with a redirected stdin
+ * pipe does not reliably process piped input, so we run each line directly
+ * through the proven run_command() (cmd.exe /c) path and stream the output
+ * back via the ring buffer. Called from the main thread. */
 static void term_write_input(const char *data, int len) {
-    if (!g_term.active || g_term.hInWrite == INVALID_HANDLE_VALUE) return;
-    DWORD w;
-    WriteFile(g_term.hInWrite, data, len, &w, NULL);
-    fprintf(stderr, "[term-input] wrote %lu bytes\n", w);
+    if (!g_term.active) return;
+    for (int i = 0; i < len; i++) {
+        char c = data[i];
+        if (c == '\n' || c == '\r') {
+            if (g_term_linelen > 0) {
+                g_term_line[g_term_linelen] = 0;
+                static char out[32768];
+                int rc = run_command(g_term_line, out, sizeof(out));
+                (void)rc;
+                EnterCriticalSection(&g_term.lock);
+                int ol = (int)strlen(out);
+                int space = (int)sizeof(g_term.outbuf) - g_term.outlen;
+                int cpy = ol < space ? ol : space;
+                if (cpy > 0) {
+                    memcpy(g_term.outbuf + g_term.outlen, out, cpy);
+                    g_term.outlen += cpy;
+                }
+                LeaveCriticalSection(&g_term.lock);
+                g_term_linelen = 0;
+            }
+        } else if (c == '\x03') {
+            /* Ctrl-C: drop the in-flight line */
+            g_term_linelen = 0;
+        } else if (g_term_linelen < (int)sizeof(g_term_line) - 1) {
+            g_term_line[g_term_linelen++] = c;
+        }
+    }
 }
 
 static void term_stop(void) {
     if (!g_term.active) return;
     g_term.active = 0;
-    /* Kill the child shell so reader thread drains and exits. */
-    if (g_term.hProc) {
-        HANDLE hp = OpenProcess(PROCESS_TERMINATE, FALSE, GetProcessId(g_term.hProc));
-        if (hp) { TerminateProcess(hp, 1); CloseHandle(hp); }
-    }
-    if (g_term.hThread) {
-        WaitForSingleObject(g_term.hThread, 2000);
-        CloseHandle(g_term.hThread);
-        g_term.hThread = NULL;
-    }
-    if (g_term.hInWrite != INVALID_HANDLE_VALUE) { CloseHandle(g_term.hInWrite); g_term.hInWrite = INVALID_HANDLE_VALUE; }
-    if (g_term.hOutRead != INVALID_HANDLE_VALUE) { CloseHandle(g_term.hOutRead); g_term.hOutRead = INVALID_HANDLE_VALUE; }
-    if (g_term.hProc) { CloseHandle(g_term.hProc); g_term.hProc = NULL; }
+    g_term_linelen = 0;
     term_send("term-end", "", 0, 0);
-}
-
-static DWORD WINAPI term_reader_thread(LPVOID lp) {
-    (void)lp;
-    char tmp[4096];
-    DWORD r;
-    while (g_term.active && ReadFile(g_term.hOutRead, tmp, sizeof(tmp), &r, NULL) && r > 0) {
-        EnterCriticalSection(&g_term.lock);
-        /* append into ring; drop if overflow (avoid deadlock) */
-        int space = (int)sizeof(g_term.outbuf) - g_term.outlen;
-        if (space > 0) {
-            int c = (int)r; if (c > space) c = space;
-            memcpy(g_term.outbuf + g_term.outlen, tmp, c);
-            g_term.outlen += c;
-        }
-        LeaveCriticalSection(&g_term.lock);
-    }
-    /* process exited */
-    int rc = -1;
-    if (g_term.hProc) {
-        DWORD code = 0;
-        if (GetExitCodeProcess(g_term.hProc, &code)) rc = (int)code;
-    }
-    EnterCriticalSection(&g_term.lock);
-    g_term.exited = 1;
-    g_term.exitrc = rc;
-    LeaveCriticalSection(&g_term.lock);
-    g_term.active = 0;
-    return 0;
 }
 
 /* Called from the main thread (which owns the socket): drain buffered
@@ -792,36 +780,10 @@ static int term_drain(void) {
     return 0;
 }
 
-/* Launch an interactive cmd.exe with redirected pipes and stream output. */
+/* Open an interactive terminal session. Input is executed line-by-line via
+ * run_command() and output is streamed back to the viewer. */
 static int run_interactive(const char *to, const char *id) {
     if (g_term.active) term_stop();
-
-    HANDLE hInRead = INVALID_HANDLE_VALUE, hInWrite = INVALID_HANDLE_VALUE;
-    HANDLE hOutRead = INVALID_HANDLE_VALUE, hOutWrite = INVALID_HANDLE_VALUE;
-    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
-    if (!CreatePipe(&hInRead, &hInWrite, &sa, 0)) return -1;
-    if (!CreatePipe(&hOutRead, &hOutWrite, &sa, 0)) {
-        CloseHandle(hInRead); CloseHandle(hInWrite); return -1;
-    }
-
-    STARTUPINFOA si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.hStdOutput = hOutWrite;
-    si.hStdError = hOutWrite;
-    si.hStdInput = hInRead;
-    si.dwFlags = STARTF_USESTDHANDLES;
-
-    if (!CreateProcessA(NULL, "cmd.exe", NULL, NULL, TRUE, CREATE_NO_WINDOW,
-                        NULL, NULL, &si, &pi)) {
-        CloseHandle(hInRead); CloseHandle(hInWrite);
-        CloseHandle(hOutRead); CloseHandle(hOutWrite);
-        return -1;
-    }
-    CloseHandle(hOutWrite);   /* child has its copy */
-    CloseHandle(hInRead);     /* child has its copy */
-    CloseHandle(pi.hThread);
 
     memset(&g_term, 0, sizeof(g_term));
     g_term.active = 1;
@@ -829,12 +791,9 @@ static int run_interactive(const char *to, const char *id) {
     g_term.outlen = 0;
     g_term.exited = 0;
     g_term.exitrc = -1;
+    g_term_linelen = 0;
     strncpy(g_term.id, id, sizeof(g_term.id) - 1);
     strncpy(g_term.to, to, sizeof(g_term.to) - 1);
-    g_term.hInWrite = hInWrite;
-    g_term.hOutRead = hOutRead;
-    g_term.hProc = pi.hProcess;
-    g_term.hThread = CreateThread(NULL, 0, term_reader_thread, NULL, 0, NULL);
 
     term_send("term-data", "", 0, -1); /* open the stream on the viewer side */
     return 0;
@@ -1138,22 +1097,24 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
             static unsigned char dec[22000];
             int dl = (int)strlen(data);
             int out = 0;
-            for (int i = 0; i + 3 <= dl; i += 4) {
-                int v = 0;
-                for (int k = 0; k < 4; k++) {
-                    char c = data[i + k];
-                    int val = -1;
-                    if (c >= 'A' && c <= 'Z') val = c - 'A';
-                    else if (c >= 'a' && c <= 'z') val = c - 'a' + 26;
-                    else if (c >= '0' && c <= '9') val = c - '0' + 52;
-                    else if (c == '+') val = 62;
-                    else if (c == '/') val = 63;
-                    else break; /* '=' padding */
-                    v = (v << 6) | val;
-                }
-                dec[out++] = (unsigned char)((v >> 16) & 0xff);
-                if (data[i+2] != '=') dec[out++] = (unsigned char)((v >> 8) & 0xff);
-                if (data[i+3] != '=') dec[out++] = (unsigned char)(v & 0xff);
+            for (int i = 0; i + 3 < dl; i += 4) {
+                int a = 0, b = 0, c = 0, d = 0;
+                #define B64VAL(x) \
+                    ((x) >= 'A' && (x) <= 'Z' ? (x) - 'A' : \
+                     (x) >= 'a' && (x) <= 'z' ? (x) - 'a' + 26 : \
+                     (x) >= '0' && (x) <= '9' ? (x) - '0' + 52 : \
+                     (x) == '+' ? 62 : (x) == '/' ? 63 : 0)
+                a = B64VAL(data[i]);
+                b = B64VAL(data[i + 1]);
+                c = (data[i + 2] == '=') ? 0 : B64VAL(data[i + 2]);
+                d = (data[i + 3] == '=') ? 0 : B64VAL(data[i + 3]);
+                #undef B64VAL
+                int triple = (a << 18) | (b << 12) | (c << 6) | d;
+                dec[out++] = (unsigned char)((triple >> 16) & 0xff);
+                if (data[i + 2] != '=')
+                    dec[out++] = (unsigned char)((triple >> 8) & 0xff);
+                if (data[i + 3] != '=')
+                    dec[out++] = (unsigned char)(triple & 0xff);
             }
             term_write_input((char *)dec, out);
         } else if (strcmp(type, "term-end") == 0) {
