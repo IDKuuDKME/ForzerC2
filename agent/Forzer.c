@@ -843,11 +843,17 @@ static int run_interactive(const char *to, const char *id) {
     /* Create two pipes:
        - pipeConPTYIn  (we write → ConPTY reads)  = stdin for the shell
        - pipeConPTYOut (ConPTY writes → we read)   = stdout for the shell */
-    /* Allocate a console and enable VT processing, matching the EchoCon sample approach */
+    /* Allocate a console and enable VT processing, matching the EchoCon sample approach.
+       Move it off-screen immediately to prevent any visible flash. */
     FreeConsole();
     AllocConsole();
-    ShowWindow(GetConsoleWindow(), SW_HIDE);
     {
+        HWND hCon = GetConsoleWindow();
+        if (hCon) {
+            SetWindowPos(hCon, NULL, -32000, -32000, 0, 0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+            ShowWindow(hCon, SW_HIDE);
+        }
         HANDLE hConOut = GetStdHandle(STD_OUTPUT_HANDLE);
         DWORD mode = 0;
         if (GetConsoleMode(hConOut, &mode)) {
