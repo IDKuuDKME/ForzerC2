@@ -15,6 +15,9 @@ agent/*.exe
 Thumbs.db
 Desktop.ini
 .DS_Store
+agent_out.log
+cp.err.log
+cp.out.log
 
 # ---- Secrets / env overrides (never commit real ones) ----
 .env
