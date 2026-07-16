@@ -264,16 +264,10 @@
             <div class="meta" id="console-meta"></div>
           </div>
           <div style="display:flex;gap:8px;align-items:center;">
-            <button id="term-toggle" style="background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:6px 10px;cursor:pointer;font-size:12px;">Live Terminal</button>
             <button class="console-close" id="console-close" title="Close">&times;</button>
           </div>
         </div>
-        <div id="console-out" style="flex:1;overflow:auto;padding:14px 18px;font-family:monospace;font-size:12.5px;white-space:pre-wrap;word-break:break-word;color:var(--text);"></div>
-        <div id="term-container" style="display:none;flex:1;overflow:hidden;"></div>
-        <div class="console-in" id="cmd-input-bar">
-          <input id="console-input" type="text" placeholder="type a command and press Enter…" autocomplete="off" />
-          <button id="console-send">Run</button>
-        </div>
+        <div id="term-container" style="flex:1;overflow:hidden;"></div>
       </div>
 
 
@@ -367,13 +361,10 @@
 
   /* ----------------------------- Peer console ----------------------------- */
   var consoleEl = document.getElementById('console');
-  var consoleOut = document.getElementById('console-out');
-  var consoleInput = document.getElementById('console-input');
   var consoleTitle = document.getElementById('console-title');
   var consoleMeta = document.getElementById('console-meta');
   var activePeerId = null;
   var reqCounter = 0;
-  var pending = {}; // request id -> peer id (so results route to the right console)
 
   function markActive() {
     var rows = body.querySelectorAll('tr');
@@ -390,49 +381,19 @@
     if (!p) return;
     activePeerId = id;
     consoleTitle.textContent = (p.name || 'unnamed') + '  (' + (p.ip || '') + ')';
-    consoleMeta.textContent = 'id ' + id + ' · click "Live Terminal" for an interactive shell';
-    consoleOut.innerHTML = '';
-    appendSys('Connected to peer. Click "Live Terminal" for an interactive shell.');
+    consoleMeta.textContent = 'id ' + id;
     consoleEl.classList.add('open');
     markActive();
-    // If terminal is active, fit it after the drawer animation
-    setTimeout(function () { if (fitAddon) fitAddon.fit(); }, 250);
-    consoleInput.focus();
+    // Auto-start the live terminal
+    if (!termActive) termStart();
+    setTimeout(function () { if (fitAddon) fitAddon.fit(); xterm && xterm.focus(); }, 300);
   }
 
   function closeConsole() {
+    if (termActive) termStop();
     consoleEl.classList.remove('open');
     activePeerId = null;
     markActive();
-  }
-
-  function appendLine(cls, text) {
-    var div = document.createElement('div');
-    div.className = cls;
-    div.textContent = text;
-    consoleOut.appendChild(div);
-    consoleOut.scrollTop = consoleOut.scrollHeight;
-  }
-  function appendCmd(text) { appendLine('cmd', text); }
-  function appendResult(text) { appendLine('', text); }
-  function appendErr(text) { appendLine('err', text); }
-  function appendSys(text) { appendLine('sys', text); }
-
-  function sendCommand() {
-    if (!activePeerId) return;
-    var cmd = consoleInput.value;
-    if (!cmd.trim()) return;
-    appendCmd(cmd);
-    consoleInput.value = '';
-    var id = 'w' + (++reqCounter) + '-' + Date.now().toString(36);
-    pending[id] = activePeerId;
-    if (ws && ws.readyState === 1) {
-      ws.send(JSON.stringify({
-        type: 'command', to: activePeerId, id: id, data: cmd
-      }));
-    } else {
-      appendErr('not connected to control plane');
-    }
   }
 
   /* --------------------------- Live terminal --------------------------- */
@@ -441,8 +402,6 @@
   var xterm = null;
   var fitAddon = null;
   var termContainer = document.getElementById('term-container');
-  var cmdOut = document.getElementById('console-out');
-  var cmdInputBar = document.getElementById('cmd-input-bar');
 
   function b64enc(str) {
     var out = '';
@@ -467,11 +426,6 @@
     if (!activePeerId || termActive) return;
     termId = 't' + (++reqCounter) + '-' + Date.now().toString(36);
     termActive = true;
-
-    // Switch UI: hide command output/input, show xterm
-    cmdOut.style.display = 'none';
-    cmdInputBar.style.display = 'none';
-    termContainer.style.display = '';
 
     // Create xterm instance
     xterm = new Terminal({
@@ -528,7 +482,6 @@
       // Future: send resize event to agent if supported
     });
 
-    document.getElementById('term-toggle').textContent = 'Terminal: ON';
     if (ws && ws.readyState === 1)
       ws.send(JSON.stringify({ type: 'term-start', to: activePeerId, id: termId }));
 
@@ -539,33 +492,15 @@
   function termStop() {
     if (!termActive) return;
     termActive = false;
-    document.getElementById('term-toggle').textContent = 'Live Terminal';
 
     // Destroy xterm instance
     if (xterm) { xterm.dispose(); xterm = null; fitAddon = null; }
-
-    // Switch UI back: show command output/input
-    termContainer.style.display = 'none';
-    cmdOut.style.display = '';
-    cmdInputBar.style.display = '';
 
     if (ws && ws.readyState === 1 && termId)
       ws.send(JSON.stringify({ type: 'term-end', to: activePeerId, id: termId }));
     termId = null;
   }
 
-  function sendOrTerm() {
-    if (termActive) return; // xterm handles input directly
-    sendCommand();
-  }
-
-  document.getElementById('console-send').addEventListener('click', sendOrTerm);
-  consoleInput.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') { e.preventDefault(); sendOrTerm(); }
-  });
-  document.getElementById('term-toggle').addEventListener('click', function () {
-    if (termActive) termStop(); else termStart();
-  });
   document.getElementById('console-close').addEventListener('click', function () {
     if (termActive) termStop();
     activePeerId = null;
@@ -606,18 +541,6 @@
           render(msg);
           log('mesh update &middot; <b>' + (msg.peers ? msg.peers.length : 0) +
               '</b> peer(s) &middot; v' + msg.version);
-        } else if (msg.type === 'command-result') {
-          if (pending[msg.id]) {
-            delete pending[msg.id];
-            var header = 'rc=' + (msg.rc == null ? '?' : msg.rc);
-            appendSys('--- ' + header + ' ---');
-            appendResult(msg.data || '');
-          }
-        } else if (msg.type === 'command-error') {
-          if (pending[msg.id]) {
-            delete pending[msg.id];
-            appendErr(msg.error || 'command failed');
-          }
         } else if (msg.type === 'term-data') {
           // streaming shell output for the active session (base64 payload)
           if (msg.id === termId && termActive && xterm) {
@@ -627,11 +550,7 @@
           if (msg.id === termId) {
             if (xterm) xterm.write('\r\n\x1b[33m--- shell exited ---\x1b[0m\r\n');
             termActive = false;
-            document.getElementById('term-toggle').textContent = 'Live Terminal';
             if (xterm) { xterm.dispose(); xterm = null; fitAddon = null; }
-            termContainer.style.display = 'none';
-            cmdOut.style.display = '';
-            cmdInputBar.style.display = '';
             termId = null;
           }
         } else if (msg.type === 'term-end') {
