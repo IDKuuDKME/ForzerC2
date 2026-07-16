@@ -5,16 +5,16 @@ A small peer-to-peer mesh control toolkit with three cooperating parts:
 | Component | Path | What it is |
 |-----------|------|------------|
 | **Agent** | [`agent/`](./agent) | Windows C client (`Forzer.c`) that connects to the control plane over WebSocket (ws / wss via Schannel), runs remote commands and interactive shells. |
-| **Control plane** | [`control-plane/`](./control-plane) | Node.js WebSocket server (`server.js`) that registers peers, relays signalling/commands, and serves a web dashboard. Deployable to Render. |
+| **Control plane** | [`server/`](./server) | Node.js WebSocket server (`server.js`) that registers peers, relays signalling/commands, and serves a web dashboard. Deployable to Render. |
 | **MCP server** | [`mcp/`](./mcp) | Zero-dependency Model Context Protocol server exposing the control plane (list peers, run commands, open terminals) over stdio JSON-RPC. |
 
 ## Layout
 
 ```
 NotSoSafe/
-├── agent/            # Windows C agent (Forzer.c) + compiled binaries (.exe, gitignored)
-├── control-plane/    # Node.js server.js, public/dashboard.html, render.yaml, package.json
-├── mcp/              # mcp-server.js + package.json
+├── agent/         # Windows C agent (Forzer.c) + compiled binary (Forzer.exe)
+├── server/        # Node.js server.js, public/dashboard.html, render.yaml, package.json
+├── mcp/           # mcp-server.js + package.json
 ├── .gitignore
 ├── LICENSE
 └── README.md
@@ -24,7 +24,7 @@ NotSoSafe/
 
 ### Control plane
 ```bash
-cd control-plane
+cd server
 npm install
 npm start            # listens on PORT (default 3000)
 # dashboard: http://localhost:3000/dashboard

@@ -1,13 +1,15 @@
 # ---- Dependencies ----
 node_modules/
 
-# ---- Build artifacts & runtime binaries (agent) ----
+# ---- Build artifacts ----
 *.bak
 *_test.exe
-Forzer_test.exe
-# Compiled agents (build from source instead of committing binaries)
+*_test*.exe
+*_dbg.exe
+pipecheck.exe
+
+# ---- Agent binary (source-built, commit the release binary only) ----
 agent/*.exe
-# ...except the released agent binary, so FORZER_UPDATE_URL can self-update to it
 !agent/Forzer.exe
 
 # ---- Runtime / OS junk ----
@@ -16,10 +18,8 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 agent_out.log
-cp.err.log
-cp.out.log
 
-# ---- Secrets / env overrides (never commit real ones) ----
+# ---- Secrets / env overrides ----
 .env
 .env.*
 *.local
