@@ -1052,15 +1052,33 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
 
     char buf[131072];
     int reconnect = 0;
+    /* Poll the socket so the main loop wakes often enough to flush buffered
+       terminal output even when the server is idle (no inbound frames). A
+       purely blocking recv would stall the live terminal for up to 30s until
+       the next server ping arrived. */
+    WSAPOLLFD pfd;
+    pfd.fd = g_sock;
+    pfd.events = POLLRDNORM;
+    pfd.revents = 0;
     for (;;) {
-        int n = tr_recv(buf, sizeof(buf) - 1);
-        if (n < 0) {
-            printf("connection closed\n");
+        int n = 0;
+        int pr = WSAPoll(&pfd, 1, 50);
+        if (pr > 0 && (pfd.revents & (POLLRDNORM | POLLRDBAND))) {
+            n = tr_recv(buf, sizeof(buf) - 1);
+            if (n < 0) {
+                printf("connection closed\n");
+                reconnect = 1;
+                break;
+            }
+        } else if (pr < 0) {
+            if (WSAGetLastError() == WSAEINTR) continue;
+            printf("connection closed (poll)\n");
             reconnect = 1;
             break;
         }
-        buf[n] = 0;
         term_drain(); /* pump any buffered terminal output (main thread owns socket) */
+        if (n > 0) {
+            buf[n] = 0;
         char type[32] = {0};
         json_str(buf, "type", type, sizeof(type));
         char from[64] = {0};
@@ -1150,6 +1168,7 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
         } else {
             printf("[msg] %s\n", buf);
         }
+        } /* end if (n > 0) */
     }
 
     if (thr) {
