@@ -153,6 +153,7 @@ typedef struct {
     HANDLE hPipeOut;       /* our end: write ConPTY input */
     HANDLE hProcess;       /* child cmd.exe process handle */
     HANDLE hReaderThread;  /* background reader thread */
+    int reader_exited;     /* set by reader thread when pipe breaks */
 } term_session_t;
 
 static term_session_t g_term;
@@ -688,6 +689,8 @@ static int run_command(const char *cmd, char *out, int cap) {
 }
 
 /* Send a terminal protocol frame back to the control plane. */
+static int run_interactive(const char *to, const char *id);
+
 static void term_send(const char *kind, const char *data, int len, int rc) {
     static char b64[44000];
     int need = ((len + 2) / 3) * 4 + 1;
@@ -755,6 +758,7 @@ static DWORD WINAPI conpty_reader(LPVOID lp) {
         }
         LeaveCriticalSection(&g_term.lock);
     }
+    g_term.reader_exited = 1;
     return 0;
 }
 
@@ -763,50 +767,56 @@ static void term_write_input(const char *data, int len) {
     if (!g_term.active || !data || len <= 0) return;
     if (g_term.hPipeOut == INVALID_HANDLE_VALUE) return;
     DWORD written = 0;
-    WriteFile(g_term.hPipeOut, data, (DWORD)len, &written, NULL);
+    BOOL ok = WriteFile(g_term.hPipeOut, data, (DWORD)len, &written, NULL);
+    if (!ok) {
+        /* Pipe broken — flag for restart */
+        g_term.reader_exited = 1;
+    }
 }
 
-static void term_stop(void) {
+static void term_stop_quiet(void) {
     if (!g_term.active && !g_term.hPC) return;
     g_term.active = 0;
-
-    /* Terminate the child process (cmd.exe) */
     if (g_term.hProcess != INVALID_HANDLE_VALUE) {
         TerminateProcess(g_term.hProcess, 0);
         WaitForSingleObject(g_term.hProcess, 2000);
         CloseHandle(g_term.hProcess);
         g_term.hProcess = INVALID_HANDLE_VALUE;
     }
-
-    /* Close the pseudo console */
-    if (g_term.hPC) {
-        pClosePseudoConsole(g_term.hPC);
-        g_term.hPC = NULL;
-    }
-
-    /* Close pipe handles */
-    if (g_term.hPipeIn != INVALID_HANDLE_VALUE) {
-        CloseHandle(g_term.hPipeIn);
-        g_term.hPipeIn = INVALID_HANDLE_VALUE;
-    }
-    if (g_term.hPipeOut != INVALID_HANDLE_VALUE) {
-        CloseHandle(g_term.hPipeOut);
-        g_term.hPipeOut = INVALID_HANDLE_VALUE;
-    }
-
-    /* Wait for reader thread to finish */
+    if (g_term.hPC) { pClosePseudoConsole(g_term.hPC); g_term.hPC = NULL; }
+    if (g_term.hPipeIn != INVALID_HANDLE_VALUE) { CloseHandle(g_term.hPipeIn); g_term.hPipeIn = INVALID_HANDLE_VALUE; }
+    if (g_term.hPipeOut != INVALID_HANDLE_VALUE) { CloseHandle(g_term.hPipeOut); g_term.hPipeOut = INVALID_HANDLE_VALUE; }
     if (g_term.hReaderThread != INVALID_HANDLE_VALUE) {
         WaitForSingleObject(g_term.hReaderThread, 2000);
         CloseHandle(g_term.hReaderThread);
         g_term.hReaderThread = INVALID_HANDLE_VALUE;
     }
-
     DeleteCriticalSection(&g_term.lock);
-    term_send("term-end", "", 0, 0);
+}
+
+static void term_stop(void) {
+    if (!g_term.active && !g_term.hPC) return;
+    char saved_id[64] = {0};
+    strncpy(saved_id, g_term.id, sizeof(saved_id));
+    term_stop_quiet();
+    if (saved_id[0]) term_send("term-end", "", 0, 0);
 }
 
 static int term_drain(void) {
     if (!g_term.id[0]) return 0;
+
+    /* Detect child process exit and auto-restart */
+    if (g_term.active && g_term.reader_exited) {
+        /* Clean up the dead ConPTY and restart */
+        char saved_id[64], saved_to[64];
+        strncpy(saved_id, g_term.id, sizeof(saved_id));
+        strncpy(saved_to, g_term.to, sizeof(saved_to));
+        term_stop_quiet();
+        /* Re-start the session with the same id/to so the viewer stays connected */
+        run_interactive(saved_to, saved_id);
+        return 0;
+    }
+
     EnterCriticalSection(&g_term.lock);
     int len = g_term.outlen;
     if (len > 0) {
@@ -1282,7 +1292,8 @@ static int connect_mode(const char *url, const char *setup_key, const char *name
         thr = NULL;
     }
 
-    term_stop(); /* kill any live shell session on disconnect */
+    /* NOTE: Do NOT call term_stop() here. The terminal session survives
+       WS reconnects. The ConPTY keeps running independently. */
 
     /* Tear down the current socket before (re)connecting. */
     if (g_use_tls) {
