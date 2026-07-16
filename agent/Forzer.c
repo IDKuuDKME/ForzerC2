@@ -99,22 +99,60 @@ static int tr_send(const char *data, int len);
 static int tr_recv(char *out, int cap);
 
 /* ------------------------------------------------------------------ */
-/* Interactive terminal session (state-tracked line executor)         */
+/* ConPTY-based interactive terminal                                  */
 /*                                                                   */
-/* Each line runs through cmd.exe /c. We track the current directory  */
-/* and environment so cd/set/dir etc behave as if in a real shell.    */
+/* Uses Windows 10 1809+ Pseudo Console (ConPTY) for a real shell.   */
+/* A background reader thread captures output; input is written via   */
+/* WriteFile on the ConPTY stdin pipe.                                */
 /* ------------------------------------------------------------------ */
+
+#ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
+#define ProcThreadAttributePseudoConsole 22
+#define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE \
+    ProcThreadAttributeValue(ProcThreadAttributePseudoConsole, FALSE, TRUE, FALSE)
+#endif
+
+typedef HRESULT (WINAPI *fnCreatePseudoConsole_t)(COORD, HANDLE, HANDLE, DWORD, void**);
+typedef VOID    (WINAPI *fnClosePseudoConsole_t)(void*);
+typedef BOOL    (WINAPI *fnInitializeProcThreadAttributeList_t)(LPPROC_THREAD_ATTRIBUTE_LIST, DWORD, DWORD, PSIZE_T);
+typedef BOOL    (WINAPI *fnUpdateProcThreadAttribute_t)(LPPROC_THREAD_ATTRIBUTE_LIST, DWORD, DWORD_PTR, PVOID, SIZE_T, PVOID, PSIZE_T);
+typedef VOID    (WINAPI *fnDeleteProcThreadAttributeList_t)(LPPROC_THREAD_ATTRIBUTE_LIST);
+
+static fnCreatePseudoConsole_t    pCreatePseudoConsole    = NULL;
+static fnClosePseudoConsole_t     pClosePseudoConsole     = NULL;
+static fnInitializeProcThreadAttributeList_t pInitializeProcThreadAttributeList = NULL;
+static fnUpdateProcThreadAttribute_t pUpdateProcThreadAttribute = NULL;
+static fnDeleteProcThreadAttributeList_t pDeleteProcThreadAttributeList = NULL;
+static int g_conpty_available = -1; /* -1=not checked, 0=no, 1=yes */
+
+static int conpty_init(void) {
+    if (g_conpty_available >= 0) return g_conpty_available;
+    HMODULE hK32 = GetModuleHandleA("kernel32.dll");
+    if (!hK32) { g_conpty_available = 0; return 0; }
+    pCreatePseudoConsole    = (fnCreatePseudoConsole_t)    GetProcAddress(hK32, "CreatePseudoConsole");
+    pClosePseudoConsole     = (fnClosePseudoConsole_t)     GetProcAddress(hK32, "ClosePseudoConsole");
+    pInitializeProcThreadAttributeList = (fnInitializeProcThreadAttributeList_t) GetProcAddress(hK32, "InitializeProcThreadAttributeList");
+    pUpdateProcThreadAttribute = (fnUpdateProcThreadAttribute_t) GetProcAddress(hK32, "UpdateProcThreadAttribute");
+    pDeleteProcThreadAttributeList = (fnDeleteProcThreadAttributeList_t) GetProcAddress(hK32, "DeleteProcThreadAttributeList");
+    g_conpty_available = (pCreatePseudoConsole && pClosePseudoConsole &&
+                          pInitializeProcThreadAttributeList && pUpdateProcThreadAttribute) ? 1 : 0;
+    if (!g_conpty_available)
+        fprintf(stderr, "[conpty] CreatePseudoConsole not available (needs Win10 1809+)\n");
+    return g_conpty_available;
+}
 
 typedef struct {
     int active;
     char id[64];
     char to[64];
     CRITICAL_SECTION lock;
-    char outbuf[1<<20];
+    char outbuf[1<<20];    /* buffered ConPTY output (reader thread writes, main thread drains) */
     int outlen;
-    char cwd[MAX_PATH];
-    char linebuf[8192];
-    int linelen;
+    void *hPC;             /* HPCON (pseudo console handle) */
+    HANDLE hPipeIn;        /* our end: read ConPTY output */
+    HANDLE hPipeOut;       /* our end: write ConPTY input */
+    HANDLE hProcess;       /* child cmd.exe process handle */
+    HANDLE hReaderThread;  /* background reader thread */
 } term_session_t;
 
 static term_session_t g_term;
@@ -651,19 +689,15 @@ static int run_command(const char *cmd, char *out, int cap) {
 
 /* Send a terminal protocol frame back to the control plane. */
 static void term_send(const char *kind, const char *data, int len, int rc) {
-    /* Base64 the raw bytes so binary/CRLF survive the JSON transport. */
     static char b64[44000];
     int need = ((len + 2) / 3) * 4 + 1;
     if (need > (int)sizeof(b64)) need = (int)sizeof(b64);
     int n = 0;
     if (len > 0) {
-        /* chunked base64 to bound stack usage */
-        char tmp[4096];
         int done = 0;
         while (done < len) {
             int c = len - done; if (c > 3072) c = 3072;
             char chunkb64[4100];
-            /* base64 of data+done..c */
             int outi = 0;
             const unsigned char *p = (const unsigned char *)data + done;
             for (int i = 0; i + 2 < c; i += 3) {
@@ -704,97 +738,70 @@ static void term_send(const char *kind, const char *data, int len, int rc) {
     tr_send(msg, (int)strlen(msg));
 }
 
-static void term_write_input(const char *data, int len) {
-    if (!g_term.active) return;
-    for (int i = 0; i < len; i++) {
-        char c = data[i];
-        if (c == '\n' || c == '\r') {
-            if (g_term.linelen > 0) {
-                g_term.linebuf[g_term.linelen] = 0;
-                char fullCmd[8500];
-                if (g_term.cwd[0]) {
-                    snprintf(fullCmd, sizeof(fullCmd), "cd /d \"%s\" && %s", g_term.cwd, g_term.linebuf);
-                } else {
-                    snprintf(fullCmd, sizeof(fullCmd), "%s", g_term.linebuf);
-                }
-                static char out[32768];
-                int rc = run_command(fullCmd, out, sizeof(out));
-
-                /* Track CWD changes: if command starts with "cd " or "chdir ",
-                   extract the target path and update g_term.cwd */
-                char cmdLower[8192];
-                for (int j = 0; g_term.linebuf[j]; j++)
-                    cmdLower[j] = (g_term.linebuf[j] >= 'A' && g_term.linebuf[j] <= 'Z') ?
-                        g_term.linebuf[j] + 32 : g_term.linebuf[j];
-                cmdLower[g_term.linelen] = 0;
-                if (strncmp(cmdLower, "cd ", 3) == 0 ||
-                    strncmp(cmdLower, "chdir ", 6) == 0) {
-                    const char *arg = strncmp(cmdLower, "cd ", 3) == 0 ?
-                        g_term.linebuf + 3 : g_term.linebuf + 6;
-                    while (*arg == ' ') arg++;
-                    if (*arg == '/' && (arg[1] == 'd' || arg[1] == 'D')) {
-                        arg += 2; while (*arg == ' ') arg++;
-                    }
-                    if (strcmp(arg, "..") == 0 && g_term.cwd[0]) {
-                        char *slash = strrchr(g_term.cwd, '\\');
-                        if (slash && slash != g_term.cwd + 2) *slash = 0;
-                        else if (slash) g_term.cwd[3] = 0;
-                    } else if (strcmp(arg, "\\") == 0) {
-                        g_term.cwd[0] = g_term.cwd[1] = g_term.cwd[2] = '\0';
-                        g_term.cwd[0] = g_term.cwd[0] ? g_term.cwd[0] : 'C';
-                        g_term.cwd[1] = ':'; g_term.cwd[2] = '\\'; g_term.cwd[3] = 0;
-                    } else if (arg[1] == ':' && (arg[2] == '\\' || arg[2] == 0)) {
-                        /* absolute path like D:\ or D:\foo */
-                        strncpy(g_term.cwd, arg, MAX_PATH);
-                        g_term.cwd[MAX_PATH-1] = 0;
-                    } else if (arg[0]) {
-                        /* relative path: append to cwd */
-                        int cl = (int)strlen(g_term.cwd);
-                        if (cl > 0 && g_term.cwd[cl-1] != '\\') g_term.cwd[cl++] = '\\';
-                        snprintf(g_term.cwd + cl, MAX_PATH - cl, "%s", arg);
-                        g_term.cwd[MAX_PATH-1] = 0;
-                    }
-                }
-
-                /* Append prompt after every command so the viewer always gets feedback */
-                EnterCriticalSection(&g_term.lock);
-                int ol = (int)strlen(out);
-                char prompt[512];
-                snprintf(prompt, sizeof(prompt), "%s>", g_term.cwd);
-                int pl = (int)strlen(prompt);
-                int space = (int)sizeof(g_term.outbuf) - g_term.outlen;
-                int cpy = ol < space ? ol : space;
-                if (cpy > 0) {
-                    memcpy(g_term.outbuf + g_term.outlen, out, cpy);
-                    g_term.outlen += cpy;
-                    space -= cpy;
-                }
-                if (pl < space) {
-                    if (cpy > 0 && g_term.outbuf[g_term.outlen-1] != '\n') {
-                        g_term.outbuf[g_term.outlen++] = '\r';
-                        g_term.outbuf[g_term.outlen++] = '\n';
-                        space -= 2;
-                    }
-                    int pp = pl < space ? pl : space;
-                    memcpy(g_term.outbuf + g_term.outlen, prompt, pp);
-                    g_term.outlen += pp;
-                }
-                LeaveCriticalSection(&g_term.lock);
-                (void)rc;
-                g_term.linelen = 0;
-            }
-        } else if (c == '\x03') {
-            g_term.linelen = 0;
-        } else if (g_term.linelen < (int)sizeof(g_term.linebuf) - 1) {
-            g_term.linebuf[g_term.linelen++] = c;
+/* Background thread: reads ConPTY output pipe and buffers it */
+static DWORD WINAPI conpty_reader(LPVOID lp) {
+    (void)lp;
+    char buf[8192];
+    DWORD nread = 0;
+    while (g_term.active) {
+        BOOL ok = ReadFile(g_term.hPipeIn, buf, sizeof(buf) - 1, &nread, NULL);
+        if (!ok || nread == 0) break;
+        EnterCriticalSection(&g_term.lock);
+        int space = (int)sizeof(g_term.outbuf) - g_term.outlen;
+        int cpy = (int)nread < space ? (int)nread : space;
+        if (cpy > 0) {
+            memcpy(g_term.outbuf + g_term.outlen, buf, cpy);
+            g_term.outlen += cpy;
         }
+        LeaveCriticalSection(&g_term.lock);
     }
+    return 0;
+}
+
+/* Write raw keystrokes directly into the ConPTY stdin pipe */
+static void term_write_input(const char *data, int len) {
+    if (!g_term.active || !data || len <= 0) return;
+    if (g_term.hPipeOut == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(g_term.hPipeOut, data, (DWORD)len, &written, NULL);
 }
 
 static void term_stop(void) {
-    if (!g_term.active) return;
+    if (!g_term.active && !g_term.hPC) return;
     g_term.active = 0;
-    g_term.linelen = 0;
+
+    /* Terminate the child process (cmd.exe) */
+    if (g_term.hProcess != INVALID_HANDLE_VALUE) {
+        TerminateProcess(g_term.hProcess, 0);
+        WaitForSingleObject(g_term.hProcess, 2000);
+        CloseHandle(g_term.hProcess);
+        g_term.hProcess = INVALID_HANDLE_VALUE;
+    }
+
+    /* Close the pseudo console */
+    if (g_term.hPC) {
+        pClosePseudoConsole(g_term.hPC);
+        g_term.hPC = NULL;
+    }
+
+    /* Close pipe handles */
+    if (g_term.hPipeIn != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_term.hPipeIn);
+        g_term.hPipeIn = INVALID_HANDLE_VALUE;
+    }
+    if (g_term.hPipeOut != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_term.hPipeOut);
+        g_term.hPipeOut = INVALID_HANDLE_VALUE;
+    }
+
+    /* Wait for reader thread to finish */
+    if (g_term.hReaderThread != INVALID_HANDLE_VALUE) {
+        WaitForSingleObject(g_term.hReaderThread, 2000);
+        CloseHandle(g_term.hReaderThread);
+        g_term.hReaderThread = INVALID_HANDLE_VALUE;
+    }
+
+    DeleteCriticalSection(&g_term.lock);
     term_send("term-end", "", 0, 0);
 }
 
@@ -817,37 +824,113 @@ static int term_drain(void) {
 static int run_interactive(const char *to, const char *id) {
     if (g_term.active) term_stop();
 
+    /* Check ConPTY availability */
+    if (!conpty_init()) {
+        fprintf(stderr, "[term] ConPTY not available on this system\n");
+        return -1;
+    }
+
     memset(&g_term, 0, sizeof(g_term));
     InitializeCriticalSection(&g_term.lock);
-    g_term.active = 1;
-    g_term.linelen = 0;
-
-    /* Start in %USERPROFILE% by default */
-    const char *up = getenv("USERPROFILE");
-    if (!up) up = getenv("HOMEDRIVE");
-    if (up) {
-        strncpy(g_term.cwd, up, MAX_PATH - 1);
-        g_term.cwd[MAX_PATH-1] = 0;
-    } else {
-        GetCurrentDirectoryA(MAX_PATH, g_term.cwd);
-    }
+    g_term.hPipeIn = INVALID_HANDLE_VALUE;
+    g_term.hPipeOut = INVALID_HANDLE_VALUE;
+    g_term.hProcess = INVALID_HANDLE_VALUE;
+    g_term.hReaderThread = INVALID_HANDLE_VALUE;
 
     strncpy(g_term.id, id, sizeof(g_term.id) - 1);
     strncpy(g_term.to, to, sizeof(g_term.to) - 1);
 
-    /* Bootstrap: send initial (empty) term-data + a banner */
-    term_send("term-data", "", 0, -1);
-    /* cmd.exe banner */
-    char banner[256];
-    snprintf(banner, sizeof(banner),
-        "\r\nMicrosoft Windows [Version %lu.%lu.%lu]\r\n(c) Microsoft Corporation. All rights reserved.\r\n\r\n%s>",
-        GetVersion() & 0xff, (GetVersion() >> 8) & 0xff, (GetVersion() >> 16) & 0x3fff, g_term.cwd);
-    EnterCriticalSection(&g_term.lock);
-    int bl = (int)strlen(banner);
-    int sp = (int)sizeof(g_term.outbuf) - g_term.outlen;
-    int cp = bl < sp ? bl : sp;
-    if (cp > 0) { memcpy(g_term.outbuf + g_term.outlen, banner, cp); g_term.outlen += cp; }
-    LeaveCriticalSection(&g_term.lock);
+    /* Create two pipes:
+       - pipeConPTYIn  (we write → ConPTY reads)  = stdin for the shell
+       - pipeConPTYOut (ConPTY writes → we read)   = stdout for the shell */
+    /* Allocate a console and enable VT processing, matching the EchoCon sample approach */
+    FreeConsole();
+    AllocConsole();
+    ShowWindow(GetConsoleWindow(), SW_HIDE);
+    {
+        HANDLE hConOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD mode = 0;
+        if (GetConsoleMode(hConOut, &mode)) {
+            SetConsoleMode(hConOut, mode | 0x0004 /* ENABLE_VIRTUAL_TERMINAL_PROCESSING */);
+        }
+    }
+
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE hPTYInRead = INVALID_HANDLE_VALUE, hPTYInWrite = INVALID_HANDLE_VALUE;
+    HANDLE hPTYOutRead = INVALID_HANDLE_VALUE, hPTYOutWrite = INVALID_HANDLE_VALUE;
+
+    if (!CreatePipe(&hPTYInRead, &hPTYInWrite, &sa, 65536) ||
+        !CreatePipe(&hPTYOutRead, &hPTYOutWrite, &sa, 65536)) {
+        fprintf(stderr, "[term] CreatePipe failed (%lu)\n", GetLastError());
+        if (hPTYInRead != INVALID_HANDLE_VALUE) CloseHandle(hPTYInRead);
+        if (hPTYInWrite != INVALID_HANDLE_VALUE) CloseHandle(hPTYInWrite);
+        if (hPTYOutRead != INVALID_HANDLE_VALUE) CloseHandle(hPTYOutRead);
+        if (hPTYOutWrite != INVALID_HANDLE_VALUE) CloseHandle(hPTYOutWrite);
+        DeleteCriticalSection(&g_term.lock);
+        return -1;
+    }
+
+    /* Create the pseudo console */
+    COORD size = { 120, 40 };
+    void *hPC = NULL;
+    HRESULT hr = pCreatePseudoConsole(size, hPTYInRead, hPTYOutWrite, 0, &hPC);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[term] CreatePseudoConsole failed (hr=0x%lx, err=%lu)\n", hr, GetLastError());
+        CloseHandle(hPTYInRead); CloseHandle(hPTYInWrite);
+        CloseHandle(hPTYOutRead); CloseHandle(hPTYOutWrite);
+        DeleteCriticalSection(&g_term.lock);
+        return -1;
+    }
+
+    /* Close the ConPTY-facing ends (ConHost holds its own copies) */
+    CloseHandle(hPTYInRead);
+    CloseHandle(hPTYOutWrite);
+
+    /* Save our ends */
+    g_term.hPC = hPC;
+    g_term.hPipeOut = hPTYInWrite;   /* we write here → shell stdin */
+    g_term.hPipeIn = hPTYOutRead;     /* we read here ← shell stdout */
+
+    /* Set up STARTUPINFOEX with the ConPTY handle */
+    STARTUPINFOEXW sie = {0};
+    sie.StartupInfo.cb = sizeof(sie);
+    SIZE_T attrListSize = 0;
+    pInitializeProcThreadAttributeList(NULL, 1, 0, &attrListSize);
+    sie.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)calloc(attrListSize, 1);
+    if (!sie.lpAttributeList ||
+        !pInitializeProcThreadAttributeList(sie.lpAttributeList, 1, 0, &attrListSize) ||
+        !pUpdateProcThreadAttribute(sie.lpAttributeList, 0,
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, hPC, sizeof(HPCON), NULL, NULL)) {
+        fprintf(stderr, "[term] ProcThreadAttribute setup failed (%lu)\n", GetLastError());
+        if (sie.lpAttributeList) { pDeleteProcThreadAttributeList(sie.lpAttributeList); free(sie.lpAttributeList); }
+        term_stop();
+        return -1;
+    }
+
+    /* Launch cmd.exe attached to the ConPTY */
+    PROCESS_INFORMATION pi = {0};
+    wchar_t cmdline[] = L"cmd.exe";
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE,
+            EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
+            &sie.StartupInfo, &pi)) {
+        fprintf(stderr, "[term] CreateProcess failed (%lu)\n", GetLastError());
+        pDeleteProcThreadAttributeList(sie.lpAttributeList);
+        free(sie.lpAttributeList);
+        term_stop();
+        return -1;
+    }
+
+    g_term.hProcess = pi.hProcess;
+    CloseHandle(pi.hThread);
+
+    /* Cleanup attribute list */
+    pDeleteProcThreadAttributeList(sie.lpAttributeList);
+    free(sie.lpAttributeList);
+
+    g_term.active = 1;
+
+    /* Start background reader thread */
+    g_term.hReaderThread = CreateThread(NULL, 0, conpty_reader, NULL, 0, NULL);
 
     return 0;
 }
