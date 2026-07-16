@@ -188,7 +188,7 @@ function deliver(ws, payload) {
 function relay(ws, msg) {
     // A registered device relays with its own device id as the source.
   if (ws.deviceId) {
-    const target = devices.get(String(msg.to || ''));
+    const target = msg.to ? devices.get(String(msg.to)) : [...devices.values()][0] || null;
     // Forward to a peer when the destination is another device.
     if (target && target.ws && target.ws.readyState === 1) {
       const payload = JSON.stringify({
@@ -226,7 +226,7 @@ function relay(ws, msg) {
   // synthetic from so the peer can reply, and remembers which viewer to
   // route the result back to.
   if (ws.viewerId && VIEWER_ROUTABLE.has(msg.type)) {
-    const target = devices.get(String(msg.to || ''));
+    const target = msg.to ? devices.get(String(msg.to)) : [...devices.values()][0] || null;
     if (!target || !target.ws || target.ws.readyState !== 1) {
       deliver(ws, JSON.stringify({ type: 'command-error', id: msg.id || null,
         to: msg.to, error: 'peer not connected' }));

