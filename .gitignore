@@ -7,6 +7,8 @@ node_modules/
 Forzer_test.exe
 # Compiled agents (build from source instead of committing binaries)
 agent/*.exe
+# ...except the released agent binary, so FORZER_UPDATE_URL can self-update to it
+!agent/Forzer.exe
 
 # ---- Runtime / OS junk ----
 *.pid

