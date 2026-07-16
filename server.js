@@ -122,8 +122,19 @@ wss.on('connection', (ws) => {
     if (msg.type === 'register') {
       handleRegister(ws, msg);
     } else if (msg.type === 'dashboard') {
-      // Read-only viewer: receives map broadcasts, cannot relay/execute.
+      // Viewer: receives map broadcasts and can issue commands to peers.
+      // Basic login gate so the dashboard can't subscribe without creds.
+      const DASH_USER = process.env.DASH_USER || 'Forgot';
+      const DASH_PASS = process.env.DASH_PASS || 'HelloWorld1!';
+      if (String(msg.user || '') !== DASH_USER ||
+          String(msg.pass || '') !== DASH_PASS) {
+        ws.send(JSON.stringify({ type: 'dashboard-auth', ok: false,
+          error: 'invalid credentials' }));
+        return ws.close();
+      }
       viewers.add(ws);
+      ws.viewerId = newId();
+      ws.send(JSON.stringify({ type: 'dashboard-ready', id: ws.viewerId }));
       ws.send(JSON.stringify({ type: 'map', version: networkVersion, peers: peerList() }));
     } else if (ROUTABLE.has(msg.type)) {
       relay(ws, msg);
@@ -166,20 +177,67 @@ function handleRegister(ws, msg) {
 // Messages routed peer-to-peer by their "to" field. The "from" is
 // stamped by the server so a peer can't spoof the sender.
 const ROUTABLE = new Set(['signal', 'command', 'command-result']);
+// Types a dashboard viewer is allowed to originate.
+const VIEWER_ROUTABLE = new Set(['command']);
+
+function deliver(ws, payload) {
+  if (ws && ws.readyState === 1) ws.send(payload);
+}
 
 function relay(ws, msg) {
-  const from = ws.deviceId;
-  if (!from) return; // must register first
-  const target = devices.get(String(msg.to || ''));
-  if (!target || !target.ws || target.ws.readyState !== 1) return;
-  target.ws.send(JSON.stringify({
-    type: msg.type,
-    from,
-    to: msg.to,
-    id: msg.id || null,
-    data: msg.data || null,
-    rc: typeof msg.rc === 'number' ? msg.rc : undefined,
-  }));
+  // A registered device relays with its own device id as the source.
+  if (ws.deviceId) {
+    const target = devices.get(String(msg.to || ''));
+    // Forward to a peer when the destination is another device.
+    if (target && target.ws && target.ws.readyState === 1) {
+      const payload = JSON.stringify({
+        type: msg.type,
+        from: ws.deviceId,
+        to: msg.to,
+        id: msg.id || null,
+        data: msg.data || null,
+        rc: typeof msg.rc === 'number' ? msg.rc : undefined,
+      });
+      target.ws.send(payload);
+    }
+    // Echo command-result back to the dashboard viewer that asked, if any.
+    if (msg.type === 'command-result' && ws.commandViewer) {
+      const v = [...viewers].find((x) => x.viewerId === ws.commandViewer);
+      if (v && v.readyState === 1) {
+        v.send(JSON.stringify({
+          type: msg.type,
+          from: ws.deviceId,
+          to: msg.to,
+          id: msg.id || null,
+          data: msg.data || null,
+          rc: typeof msg.rc === 'number' ? msg.rc : undefined,
+        }));
+      }
+      ws.commandViewer = null;
+    }
+    return;
+  }
+  // A dashboard viewer may only originate commands; the server stamps a
+  // synthetic from so the peer can reply, and remembers which viewer to
+  // route the result back to.
+  if (ws.viewerId && VIEWER_ROUTABLE.has(msg.type)) {
+    const target = devices.get(String(msg.to || ''));
+    if (!target || !target.ws || target.ws.readyState !== 1) {
+      deliver(ws, JSON.stringify({ type: 'command-error', id: msg.id || null,
+        to: msg.to, error: 'peer not connected' }));
+      return;
+    }
+    const from = 'viewer:' + ws.viewerId;
+    target.ws.commandViewer = ws.viewerId;
+    deliver(target.ws, JSON.stringify({
+      type: msg.type,
+      from,
+      to: msg.to,
+      id: msg.id || null,
+      data: msg.data || null,
+    }));
+    return;
+  }
 }
 
 // Heartbeat: terminate sockets that stop answering pings.

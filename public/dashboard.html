@@ -89,16 +89,109 @@
   .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; font-size: 12px; background: rgba(54, 211, 153, 0.12); color: var(--accent-2); border: 1px solid rgba(54,211,153,0.3); }
   .empty { padding: 40px; text-align: center; color: var(--muted); }
 
-  .log { padding: 12px 18px; max-height: 240px; overflow: auto; font-size: 12.5px; }
-  .log .row { padding: 4px 0; border-bottom: 1px solid rgba(36,48,68,0.4); color: var(--muted); }
-  .log .row b { color: var(--text); font-weight: 600; }
-  .log .row .t { color: #5d6b82; margin-right: 8px; font-variant-numeric: tabular-nums; }
+   .log { padding: 12px 18px; max-height: 240px; overflow: auto; font-size: 12.5px; }
+   .log .row { padding: 4px 0; border-bottom: 1px solid rgba(36,48,68,0.4); color: var(--muted); }
+   .log .row b { color: var(--text); font-weight: 600; }
+   .log .row .t { color: #5d6b82; margin-right: 8px; font-variant-numeric: tabular-nums; }
+
+   /* Peer console drawer */
+   tbody tr.clickable { cursor: pointer; }
+   tbody tr.clickable td:first-child { color: var(--accent); font-weight: 600; }
+   tbody tr.active { background: rgba(79, 157, 255, 0.12); }
+
+   .console {
+     position: fixed; top: 0; right: 0; height: 100vh; width: 460px; max-width: 92vw;
+     background: var(--panel); border-left: 1px solid var(--border);
+     display: flex; flex-direction: column; transform: translateX(100%);
+     transition: transform 0.22s ease; z-index: 50;
+     box-shadow: -12px 0 40px rgba(0,0,0,0.45);
+   }
+   .console.open { transform: translateX(0); }
+   .console-head {
+     display: flex; align-items: center; justify-content: space-between;
+     padding: 14px 18px; border-bottom: 1px solid var(--border);
+   }
+   .console-head h3 { margin: 0; font-size: 15px; }
+   .console-head .meta { color: var(--muted); font-size: 12px; margin-top: 3px; }
+   .console-close {
+     background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+     width: 30px; height: 30px; border-radius: 8px; cursor: pointer; font-size: 16px;
+   }
+   .console-close:hover { border-color: var(--accent); }
+   .console-out {
+     flex: 1; overflow: auto; padding: 14px 18px; font-family: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+     font-size: 12.5px; white-space: pre-wrap; word-break: break-word; color: var(--text);
+   }
+   .console-out .cmd { color: var(--accent); }
+   .console-out .cmd:before { content: "$ "; color: var(--muted); }
+   .console-out .err { color: var(--danger); }
+   .console-out .sys { color: var(--muted); font-style: italic; }
+   .console-in {
+     display: flex; border-top: 1px solid var(--border); padding: 10px; gap: 8px;
+     background: var(--panel-2);
+   }
+   .console-in input {
+     flex: 1; background: var(--panel); border: 1px solid var(--border); color: var(--text);
+     border-radius: 8px; padding: 9px 12px; font-family: inherit; font-size: 13px; outline: none;
+   }
+   .console-in input:focus { border-color: var(--accent); }
+   .console-in button {
+     background: linear-gradient(135deg, var(--accent), #7c4dff); border: none; color: #fff;
+     padding: 0 16px; border-radius: 8px; cursor: pointer; font-weight: 600;
+   }
+   .console-in button:hover { filter: brightness(1.08); }
 
   footer { color: var(--muted); font-size: 12px; text-align: center; padding: 24px; }
   code.k { color: var(--accent); }
+
+  /* Login overlay */
+  .login {
+    position: fixed; inset: 0; z-index: 100;
+    background: radial-gradient(900px 500px at 50% 0%, #15233b 0%, var(--bg) 60%);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .login.hidden { display: none; }
+  .login-card {
+    width: 340px; background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    border: 1px solid var(--border); border-radius: 16px; padding: 28px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+  .login-card h2 { margin: 0 0 4px; font-size: 18px; }
+  .login-card .sub { color: var(--muted); font-size: 12px; margin-bottom: 18px; }
+  .login-card label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+  .login-card input {
+    width: 100%; background: var(--panel); border: 1px solid var(--border);
+    color: var(--text); border-radius: 9px; padding: 10px 12px; font-size: 14px;
+    margin-bottom: 14px; outline: none; box-sizing: border-box;
+  }
+  .login-card input:focus { border-color: var(--accent); }
+  .login-card button {
+    width: 100%; background: linear-gradient(135deg, var(--accent), #7c4dff);
+    border: none; color: #fff; padding: 11px; border-radius: 9px; font-weight: 600;
+    cursor: pointer; font-size: 14px;
+  }
+  .login-card button:hover { filter: brightness(1.08); }
+  .login-err { color: var(--danger); font-size: 12.5px; min-height: 16px; margin-bottom: 10px; }
+  .login-card .hint { color: var(--muted); font-size: 11px; text-align: center; margin-top: 14px; }
+
+
 </style>
 </head>
 <body>
+  <div class="login" id="login">
+    <div class="login-card">
+      <h2>Forzer Dashboard</h2>
+      <div class="sub">Sign in to access the mesh console</div>
+      <div class="login-err" id="login-err"></div>
+      <label for="login-user">Username</label>
+      <input id="login-user" type="text" autocomplete="username" placeholder="username" />
+      <label for="login-pass">Password</label>
+      <input id="login-pass" type="password" autocomplete="current-password" placeholder="password" />
+      <button id="login-btn">Sign in</button>
+      <div class="hint">default &middot; user <code class="k">Forgot</code></div>
+    </div>
+  </div>
+
   <header>
     <div class="brand">
       <div class="logo">F</div>
@@ -110,6 +203,7 @@
     <div class="status">
       <span id="dot" class="dot"></span>
       <span id="conn">disconnected</span>
+      <button id="logout-btn" style="display:none;margin-left:8px;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:5px 10px;cursor:pointer;font-size:12px;">Log out</button>
     </div>
   </header>
 
@@ -142,22 +236,39 @@
         <h2>Peers</h2>
         <span class="hint">auto-refreshes over WebSocket</span>
       </div>
-      <div id="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>ID</th>
-              <th>Assigned IP</th>
-              <th>Public key</th>
-              <th>Status</th>
-            </tr>
-          </thead>
-          <tbody id="peers-body"></tbody>
-        </table>
-        <div id="empty" class="empty">No peers connected yet.</div>
-      </div>
-    </section>
+       <div id="table-wrap">
+         <table>
+           <thead>
+             <tr>
+               <th>Name</th>
+               <th>ID</th>
+               <th>Assigned IP</th>
+               <th>Public key</th>
+               <th>Status</th>
+             </tr>
+           </thead>
+           <tbody id="peers-body"></tbody>
+         </table>
+         <div id="empty" class="empty">No peers connected yet.</div>
+       </div>
+     </section>
+
+     <!-- Per-peer command console (slides in from the right) -->
+     <div class="console" id="console">
+       <div class="console-head">
+         <div>
+           <h3 id="console-title">Peer</h3>
+           <div class="meta" id="console-meta"></div>
+         </div>
+         <button class="console-close" id="console-close" title="Close">&times;</button>
+       </div>
+       <div class="console-out" id="console-out"></div>
+       <div class="console-in">
+         <input id="console-input" type="text" placeholder="type a command and press Enter…" autocomplete="off" />
+         <button id="console-send">Run</button>
+       </div>
+     </div>
+
 
     <section class="panel">
       <div class="panel-head">
@@ -200,6 +311,9 @@
   function shortId(id) { return id ? id.slice(0, 8) + '…' : '—'; }
   function shortKey(k) { return k ? k.slice(0, 12) + '…' + k.slice(-6) : '—'; }
 
+  // Latest peer list, keyed by id, so console clicks have fresh data.
+  var peersById = {};
+
   function render(data) {
     var peers = (data && data.peers) || [];
     document.getElementById('stat-peers').textContent = peers.length;
@@ -209,6 +323,9 @@
       now.toTimeString().slice(0, 8);
     document.getElementById('stat-clock').textContent = 'as of ' + now.toDateString();
 
+    peersById = {};
+    peers.forEach(function (p) { peersById[p.id] = p; });
+
     body.innerHTML = '';
     if (peers.length === 0) {
       empty.style.display = 'block';
@@ -216,14 +333,18 @@
       empty.style.display = 'none';
       peers.forEach(function (p) {
         var tr = document.createElement('tr');
+        tr.className = 'clickable';
         tr.innerHTML =
           '<td>' + escapeHtml(p.name || 'unnamed') + '</td>' +
           '<td class="mono">' + shortId(p.id) + '</td>' +
           '<td class="mono">' + (p.ip || '—') + '</td>' +
           '<td class="mono" title="' + escapeHtml(p.pubkey || '') + '">' + shortKey(p.pubkey) + '</td>' +
           '<td><span class="pill"><span class="dot live" style="width:7px;height:7px;"></span>online</span></td>';
+        tr.addEventListener('click', function () { openConsole(p.id); });
         body.appendChild(tr);
       });
+      // keep the currently-open console highlighted
+      if (activePeerId && peersById[activePeerId]) markActive();
     }
   }
 
@@ -233,10 +354,86 @@
       .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
+  /* ----------------------------- Peer console ----------------------------- */
+  var consoleEl = document.getElementById('console');
+  var consoleOut = document.getElementById('console-out');
+  var consoleInput = document.getElementById('console-input');
+  var consoleTitle = document.getElementById('console-title');
+  var consoleMeta = document.getElementById('console-meta');
+  var activePeerId = null;
+  var reqCounter = 0;
+  var pending = {}; // request id -> peer id (so results route to the right console)
+
+  function markActive() {
+    var rows = body.querySelectorAll('tr');
+    rows.forEach(function (r) {
+      r.classList.toggle('active',
+        r.querySelector('.mono') &&
+        r.querySelector('.mono').textContent.indexOf(
+          (activePeerId || '').slice(0, 8)) === 0);
+    });
+  }
+
+  function openConsole(id) {
+    var p = peersById[id];
+    if (!p) return;
+    activePeerId = id;
+    consoleTitle.textContent = (p.name || 'unnamed') + '  (' + (p.ip || '') + ')';
+    consoleMeta.textContent = 'id ' + id + ' · click a row, type a command, Enter to run';
+    consoleOut.innerHTML = '';
+    appendSys('Connected to peer. Commands run on the device via the agent.');
+    consoleEl.classList.add('open');
+    markActive();
+    consoleInput.focus();
+  }
+
+  function closeConsole() {
+    consoleEl.classList.remove('open');
+    activePeerId = null;
+    markActive();
+  }
+
+  function appendLine(cls, text) {
+    var div = document.createElement('div');
+    div.className = cls;
+    div.textContent = text;
+    consoleOut.appendChild(div);
+    consoleOut.scrollTop = consoleOut.scrollHeight;
+  }
+  function appendCmd(text) { appendLine('cmd', text); }
+  function appendResult(text) { appendLine('', text); }
+  function appendErr(text) { appendLine('err', text); }
+  function appendSys(text) { appendLine('sys', text); }
+
+  function sendCommand() {
+    if (!activePeerId) return;
+    var cmd = consoleInput.value;
+    if (!cmd.trim()) return;
+    appendCmd(cmd);
+    consoleInput.value = '';
+    var id = 'w' + (++reqCounter) + '-' + Date.now().toString(36);
+    pending[id] = activePeerId;
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({
+        type: 'command', to: activePeerId, id: id, data: cmd
+      }));
+    } else {
+      appendErr('not connected to control plane');
+    }
+  }
+
+  document.getElementById('console-send').addEventListener('click', sendCommand);
+  consoleInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') sendCommand();
+  });
+  document.getElementById('console-close').addEventListener('click', closeConsole);
+
   var ws = null;
   var reconnectTimer = null;
+  var creds = null; // set after successful login
 
   function connect() {
+    if (!creds) return; // must be logged in first
     var proto = location.protocol === 'https:' ? 'wss' : 'ws';
     var url = proto + '://' + location.host + '/';
     setConn('connecting', 'connecting…');
@@ -245,17 +442,39 @@
 
     ws.onopen = function () {
       setConn('live', 'live');
-      ws.send(JSON.stringify({ type: 'dashboard' }));
+      ws.send(JSON.stringify({ type: 'dashboard', user: creds.user, pass: creds.pass }));
       log('<b>connected</b> &middot; subscribed as dashboard viewer');
     };
 
     ws.onmessage = function (ev) {
       try {
         var msg = JSON.parse(ev.data);
+        if (msg.type === 'dashboard-auth' && !msg.ok) {
+          setConn('down', 'auth failed');
+          document.getElementById('login-err').textContent = msg.error || 'login failed';
+          showLogin();
+          try { ws.close(); } catch (e) {}
+          return;
+        }
         if (msg.type === 'map') {
           render(msg);
           log('mesh update &middot; <b>' + (msg.peers ? msg.peers.length : 0) +
               '</b> peer(s) &middot; v' + msg.version);
+        } else if (msg.type === 'command-result') {
+          // result routed back from a peer we asked (msg.to is our viewer id)
+          var pid = pending[msg.id];
+          if (pid && pid === activePeerId) {
+            delete pending[msg.id];
+            var header = 'rc=' + (msg.rc == null ? '?' : msg.rc);
+            appendSys('--- ' + header + ' ---');
+            appendResult(msg.data || '');
+          }
+        } else if (msg.type === 'command-error') {
+          var eid = pending[msg.id];
+          if (eid && eid === activePeerId) {
+            delete pending[msg.id];
+            appendErr(msg.error || 'command failed');
+          }
         }
       } catch (e) { /* ignore */ }
     };
@@ -274,7 +493,44 @@
     };
   }
 
-  connect();
+  /* ------------------------------- Login ------------------------------- */
+  var loginEl = document.getElementById('login');
+  var loginErr = document.getElementById('login-err');
+  var loginUser = document.getElementById('login-user');
+  var loginPass = document.getElementById('login-pass');
+  var logoutBtn = document.getElementById('logout-btn');
+
+  function showLogin() {
+    loginEl.classList.remove('hidden');
+    logoutBtn.style.display = 'none';
+  }
+  function hideLogin() {
+    loginEl.classList.add('hidden');
+    logoutBtn.style.display = 'inline-block';
+  }
+
+  function doLogin() {
+    var u = loginUser.value;
+    var p = loginPass.value;
+    loginErr.textContent = '';
+    if (!u || !p) { loginErr.textContent = 'enter username and password'; return; }
+    creds = { user: u, pass: p };
+    hideLogin();
+    connect();
+  }
+
+  document.getElementById('login-btn').addEventListener('click', doLogin);
+  loginPass.addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
+  loginUser.addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
+
+  logoutBtn.addEventListener('click', function () {
+    creds = null;
+    if (ws) { try { ws.close(); } catch (e) {} }
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    showLogin();
+    loginUser.value = '';
+    loginPass.value = '';
+  });
 </script>
 </body>
 </html>
