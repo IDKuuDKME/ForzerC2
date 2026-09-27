@@ -1,11 +1,16 @@
 'use strict';
 /* Verifies the brute-force throttle.
  *
- * Two secrets in this protocol are guessable at the wire and were previously
- * retryable forever: `SETUP_KEY` at enrolment and `DASH_PASS` at the dashboard.
- * Both are load-bearing — the dashboard password is the trust boundary for
- * every command the control plane relays — so "long enough" is a property of
- * the server, not of whoever chose the secret.
+ * The dashboard password is guessable at the wire and was previously retryable
+ * forever — one socket per guess, and every failure closed that socket and
+ * nothing else. It is load-bearing: it is the trust boundary for every command
+ * the control plane relays. So "long enough" has to be a property of the
+ * server rather than of whoever chose the secret.
+ *
+ * There is no second secret. The enrolment key this file used to exercise is
+ * gone (see the note in server.js), which leaves the dashboard password as the
+ * only guessable credential — one counter, and the lockout now also stops a
+ * blocked address from enrolling.
  *
  * Each test gets its own server process with deliberately tiny limits. The
  * counters are keyed on the remote address, and every test in this process
@@ -53,7 +58,6 @@ async function withServer(env, fn) {
       ...process.env,
       PORT: String(port),
       FORZER_DB: db,
-      SETUP_KEY: 'setup-key-under-test',
       DASH_USER: 'op',
       DASH_PASS: 'op-pass',
       ...env,
@@ -111,34 +115,24 @@ test('repeated wrong dashboard credentials lock the address out', async () => {
   });
 });
 
-test('the block applies to enrolment too, and counts both secrets together', async () => {
+test('a locked-out address cannot enrol either', async () => {
   await withServer(LIMITS, async (url) => {
-    /* Two against the dashboard, one against the join secret. The counter is
-       deliberately shared: "is something guessing at this control plane"
-       should not depend on which of the two it picked. */
-    for (let i = 0; i < 2; i++) {
+    /* Spend the budget guessing at the dashboard. The lockout is on the
+       address, not on the kind of guess, so enrolment has to be shut out too
+       — otherwise "is something guessing here" would be answered by which
+       endpoint they happened to pick. */
+    for (let i = 0; i < 3; i++) {
       const ws = await tryDashboard(url, 'wrong');
       await closed(ws);
     }
     const enrol = await open(url);
     enrol.send(JSON.stringify({
       type: 'register', name: 'x', secret: Buffer.alloc(32, 7).toString('base64'),
-      setupKey: 'wrong',
     }));
     const c = await closed(enrol);
     assert.equal(c.code, 1008);
-    assert.match(c.reason, /invalid setup key/);
-
-    /* Budget spent. A correct setup key is now refused at the door, before
-       any comparison happens. */
-    const good = await open(url);
-    good.send(JSON.stringify({
-      type: 'register', name: 'x', secret: Buffer.alloc(32, 7).toString('base64'),
-      setupKey: 'setup-key-under-test',
-    }));
-    const gc = await closed(good);
-    assert.match(gc.reason, /too many failed authentications/,
-      'a correct key must not buy its way past a lockout');
+    assert.match(c.reason, /too many failed authentications/,
+      'a blocked address is refused at the door, before any challenge is issued');
   });
 });
 

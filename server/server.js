@@ -10,38 +10,62 @@ const store = require('./store');
 const ops = require('./ops');
 
 const PORT = process.env.PORT || 3000;
-// Shared secret an implant must present to enrol for the first time. It is a
-// *join* secret: it lets a box onto the mesh, and after that the box's own
-// pinned key is what identifies it. Possessing it does not let you command
-// anything, and it cannot be used to impersonate an existing implant.
-// Override in Render with an env var; never commit a real one.
-const SETUP_KEY = process.env.SETUP_KEY || 'changeme';
 
 // Dashboard credentials. Kept at module scope so the startup warning below can
 // see them and so they are read once instead of on every message.
 const DASH_USER = process.env.DASH_USER || 'Forgot';
 const DASH_PASS = process.env.DASH_PASS || 'HelloWorld1!';
 
-if (process.env.SETUP_KEY === undefined) {
-  console.warn('[WARN] SETUP_KEY is unset — using the placeholder "changeme".');
-  console.warn('[WARN] Anyone who can reach this port can enrol an implant and have it driven.');
-}
 if (process.env.DASH_USER === undefined || process.env.DASH_PASS === undefined) {
   console.warn('[WARN] DASH_USER / DASH_PASS are unset — using the built-in default dashboard credentials.');
 }
 
-/* --- Brute-force throttle ------------------------------------------------
-   Both secrets in this protocol were previously retryable without limit: an
-   enrolment could be sprayed at `SETUP_KEY` and the dashboard at `DASH_PASS`
-   forever, one socket per guess, and every failure closed that socket and
-   nothing else. Given the dashboard password *is* the trust boundary, that is
-   the difference between a strong secret and a timed one.
+/* There is no enrolment secret. There used to be a `SETUP_KEY` that a box had
+   to present on its first `register`, on the theory that it gated who could
+   join the fleet. It gated almost nothing, and it cost a great deal:
 
-   The counters are per remote address and cover both secrets, because the
-   answer to "is someone guessing at this control plane" should not depend on
-   which of the two they happen to be guessing at. Success clears the record,
-   so an operator who fat-fingers a password twice is not locked out of their
-   own dashboard by the third try.
+   - It was not a command authority, so it protected no implant. A holder could
+     add a row to the roster and nothing else.
+   - The one thing it did buy — an attacker cannot pass a box off as yours — was
+     already bought elsewhere. `forzerctl` refuses an ambiguous name match
+     rather than picking one, so a squatter registering your box's hostname
+     makes `run DELL24-SEC-036` fail with "matches 2 implants". The attack
+     denies you a convenience; it does not impersonate.
+   - It was a credential that had to be distributed to every agent and then
+     stored in %APPDATA%\Forzer\config.json on each one, so compromising any
+     implant compromised the control plane's join capability. Removing it means
+     an implant holds no server credential at all — only its own pinned key,
+     which is what it needs to prove *it* is itself, and which is useless to
+     anyone else.
+   - And it was the secret people could not find. An operator who cannot
+     retrieve the join key cannot enrol their own box, which is the exact
+     failure this is meant to prevent.
+
+   So enrolment is open and the roster is capped instead (see MAX_IMPLANTS).
+   The trust boundary is, and always was, the dashboard password: whoever holds
+   it can already command every box on the roster, which is strictly more
+   powerful than being able to add one. */
+
+/* An open `register` means anyone who can reach this port can add a row, so
+   the roster needs a ceiling it did not need when a secret gated the door.
+   This bounds an unauthenticated write; it is not an anti-abuse control that
+   should be relied on to stop a determined caller, since such a caller can
+   simply reconnect. It exists so that a spray cannot grow the database without
+   limit and so that a flood is visible in the logs as a refusal. */
+const MAX_IMPLANTS = envInt('FORZER_MAX_IMPLANTS', 256, 1, 100000);
+
+/* --- Brute-force throttle ------------------------------------------------
+   The dashboard password was previously retryable without limit: one socket
+   per guess, and every failure closed that socket and nothing else. Given it
+   *is* the trust boundary, that is the difference between a strong secret and
+   a timed one. (The counter used to be shared with the enrolment key, which no
+   longer exists — so it is now purely a dashboard-password counter.)
+
+   The counters are per remote address, because the answer to "is someone
+   guessing at this control plane" should not depend on which connection they
+   happen to be guessing on. Success clears the record, so an operator who
+   fat-fingers a password twice is not locked out of their own dashboard by the
+   third try.
 
    A note on the address: `x-forwarded-for` is only consulted because this is
    expected to run behind a proxy (Render, a tunnel), where every socket
@@ -245,10 +269,10 @@ const server = http.createServer((req, res) => {
 // --- WebSocket protocol ---
 // Two roles and two disjoint rights. A viewer originates work; an implant only
 // ever answers. An implant proves possession of a pinned private key on every
-// connection, so `SETUP_KEY` is a join secret and not a command authority.
+// connection, and enrols on that proof alone — there is no join secret.
 //
 // Implant -> Server:
-//   { type: 'register', name, secret, setupKey }   secret = base64 32 bytes
+//   { type: 'register', name, secret }              secret = base64 32 bytes
 //   { type: 'auth', proof }                        HMAC over the challenge nonce
 //   { type: 'command-result', to, id, data, rc }
 //   { type: 'cancel-result',  to, id, rc }
@@ -479,15 +503,6 @@ wss.on('connection', (ws, req) => {
 function beginAuth(ws, msg) {
   if (ws.implantId || ws.challenge) return; // already in progress or done
 
-  /* Constant-time, like the dashboard credential. The old `!==` returned on the
-     first differing byte, which leaked the shared prefix of the key that guards
-     enrolment. */
-  if (!safeEqualStr(msg.setupKey, SETUP_KEY)) {
-    noteAuthFailure(ws.clientIp || 'unknown');
-    ws.send(JSON.stringify({ type: 'registered', error: 'invalid setup key' }));
-    return ws.close(1008, 'invalid setup key');
-  }
-
   const secret = identity.parseSecret(msg.secret);
   if (!secret) {
     ws.send(JSON.stringify({ type: 'registered', error: 'secret must be base64 of 32 bytes' }));
@@ -554,9 +569,20 @@ function finishAuth(ws, msg) {
      the same secret under a different label, so the agent can refuse to talk
      to anything that is not this control plane — with no stored pin needed,
      because the proof itself can only come from this pairing. */
-  const record = ch.isNew
-    ? registry.enroll(ch.secretB64, ch.name)
-    : registry.byId(identity.implantId(secret));
+  let record;
+  if (ch.isNew) {
+    /* Open enrolment means anyone can add a row, so the roster is capped. A
+       returning implant is exempt: refusing a box that is merely re-linking
+       would punish an ordinary reconnect for the state of the registry. */
+    if (registry.count() >= MAX_IMPLANTS) {
+      console.warn(`[auth] refusing a new implant: roster is at its cap of ${MAX_IMPLANTS}`);
+      ws.send(JSON.stringify({ type: 'registered', error: `roster is full (${MAX_IMPLANTS} implants)` }));
+      return ws.close(1008, 'roster full');
+    }
+    record = registry.enroll(ch.secretB64, ch.name);
+  } else {
+    record = registry.byId(identity.implantId(secret));
+  }
   const live = registry.markOnline(record.id, ch.name);
   implants.set(live.id, { id: live.id, name: live.name, ws,
     ops: ch.peerOps || [], proto: ch.proto || 0 });
@@ -582,8 +608,9 @@ function finishAuth(ws, msg) {
 
 /* The server is the only thing that can order an implant to do work. Every
    command path is viewer -> server -> implant, so the dashboard credential is
-   the trust boundary and SETUP_KEY is only a join secret. Possessing the setup
-   key gets a box onto the mesh as a *target*, never as a source.
+   the trust boundary and the only credential in the system. An implant holds
+   no server credential at all: it enrols on its own pinned key and that key
+   identifies nothing but itself.
 
    An implant is reply-only. It may answer a request or stream terminal
    output, and that is the complete list. `command`, `term-start`,

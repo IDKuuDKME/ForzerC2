@@ -142,6 +142,12 @@ class Registry {
       .map(toWire);
   }
 
+  /* Row count, for the roster cap. Cheap enough to run on the enrolment path
+     and it needs no secret material, so it is safe to expose. */
+  count() {
+    return this.db.prepare('SELECT COUNT(*) AS n FROM implants').get().n;
+  }
+
   toWire(implant) {
     return toWire(implant);
   }

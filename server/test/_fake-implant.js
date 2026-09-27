@@ -11,7 +11,6 @@
 const crypto = require('node:crypto');
 
 const url = process.argv[2];
-const SETUP_KEY = process.env.SETUP_KEY || 'k'.repeat(32);
 const NAME = process.env.FAKE_NAME || 'FAKE-IMPLANT';
 
 /* 32 bytes of CSPRNG output, used directly as the HMAC key — the same thing
@@ -48,7 +47,7 @@ function connect() {
   const send = (o) => ws.send(JSON.stringify(o));
 
   ws.addEventListener('open', () =>
-    send({ type: 'register', name: NAME, secret: SECRET.toString('base64'), setupKey: SETUP_KEY,
+    send({ type: 'register', name: NAME, secret: SECRET.toString('base64'),
            proto: 3, ops: FAKE_OPS }));
 
   ws.addEventListener('message', (ev) => {

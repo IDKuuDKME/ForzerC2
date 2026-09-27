@@ -19,7 +19,6 @@ const crypto = require('node:crypto');
 const identity = require('../identity');
 
 const PORT = 34711;
-const SETUP_KEY = 'test-setup-key';
 const USER = 'op';
 const PASS = 'op-pass';
 const URL = `ws://127.0.0.1:${PORT}`;
@@ -41,18 +40,17 @@ function startServer() {
       env: {
         ...process.env,
         PORT: String(PORT),
-        SETUP_KEY,
         DASH_USER: USER,
         DASH_PASS: PASS,
         /* A scratch DB per run, so a test can never be affected by — or leak
            into — the developer's real implant registry. */
         FORZER_DB: path.join(os.tmpdir(), `forzer-test-${process.pid}.db`),
-        /* These tests deliberately fail authentication twice. The throttle is
-           real and keys on 127.0.0.1, which is every socket in this file, so
-           the default threshold is eight real attempts away from turning a
-           future "and one more bad proof" test into a lockout that fails
-           everything after it. The throttle has its own file
-           (test/throttle.test.js) with its own server and its own limits. */
+        /* These tests deliberately fail authentication. The throttle is real
+           and keys on 127.0.0.1, which is every socket in this file, so the
+           default threshold is eight real attempts away from turning a future
+           "and one more bad proof" test into a lockout that fails everything
+           after it. The throttle has its own file (test/throttle.test.js)
+           with its own server and its own limits. */
         FORZER_AUTH_MAX_FAILURES: '1000',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -90,7 +88,7 @@ const next = (ws, type, ms = 2000) => new Promise((resolve, reject) => {
 
 /* opts.agent  reuse an existing keypair (to test the same implant reconnecting)
    opts.badProof send a wrong HMAC, to test rejection
-   opts.setupKey / opts.secret override the wire fields */
+   opts.secret override the wire field */
 async function registerDevice(opts = {}) {
   const agent = opts.agent || makeAgentIdentity();
   const ws = await open();
@@ -98,13 +96,12 @@ async function registerDevice(opts = {}) {
     type: 'register',
     name: opts.name || 'bot-a',
     secret: opts.secret || agent.secretB64,
-    setupKey: opts.setupKey === undefined ? SETUP_KEY : opts.setupKey,
     /* Advertise the full set unless a test is exercising a peer that predates
        an op. The server refuses work a peer says it cannot do, so a device
        that stays silent is not a neutral default here. */
-    proto: opts.proto === undefined ? 2 : opts.proto,
+    proto: opts.proto === undefined ? 3 : opts.proto,
     ops: opts.ops === undefined
-      ? ['exec', 'shell.open', 'shell.input', 'shell.close', 'sleep', 'update']
+      ? ['exec', 'shell.open', 'shell.input', 'shell.close', 'cancel', 'sleep', 'update']
       : opts.ops,
   }));
   const ch = await next(ws, 'challenge');
@@ -179,7 +176,7 @@ test('a wrong proof is refused and the socket is closed', async () => {
 test('a socket that never answers the challenge gets no implant', async () => {
   const agent = makeAgentIdentity();
   const ws = await open();
-  ws.send(JSON.stringify({ type: 'register', name: 'silent', secret: agent.secretB64, setupKey: SETUP_KEY }));
+  ws.send(JSON.stringify({ type: 'register', name: 'silent', secret: agent.secretB64 }));
   await next(ws, 'challenge');
   /* No auth frame. The socket must stay unauthenticated: it may not command
      anything, and it must not appear as an implant. */
@@ -189,22 +186,84 @@ test('a socket that never answers the challenge gets no implant', async () => {
   closeAll(ws, v);
 });
 
-test('a bad setup key never reaches the challenge', async () => {
-  const ws = await open();
-  ws.send(JSON.stringify({
-    type: 'register', name: 'x', secret: makeAgentIdentity().secretB64, setupKey: 'wrong',
-  }));
-  const reg = await next(ws, 'registered');
-  assert.match(reg.error, /setup key/);
-  /* close() is queued, so the client's close event lands a tick later. */
-  await new Promise((r) => setTimeout(r, 200));
-  assert.ok(ws.closed, 'socket should close');
+test('the roster has a cap, so open enrolment cannot grow the table forever', async () => {
+  /* Enrolment is open now that there is no join secret, so what bounds it is a
+     cap. This needs its own server — the shared one has to keep the default
+     cap, or every other test in this file would be enrolling against a
+     registry of two. */
+  const port = PORT + 1;
+  const db = path.join(os.tmpdir(), `forzer-cap-${process.pid}.db`);
+  const cap = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
+    env: { ...process.env, PORT: String(port), FORZER_DB: db, FORZER_MAX_IMPLANTS: '2',
+           DASH_USER: USER, DASH_PASS: PASS },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  try {
+    await new Promise((resolve, reject) => {
+      cap.stdout.on('data', (d) => { if (String(d).includes('listening')) resolve(); });
+      cap.on('exit', (c) => reject(new Error(`cap server exited early (${c})`)));
+      setTimeout(() => reject(new Error('cap server did not start in 5s')), 5000);
+    });
+
+    const url = `ws://127.0.0.1:${port}`;
+    /* Connect and answer the challenge. Deliberately not registerDevice(): that
+       helper targets the shared server on URL. */
+    const enrol = async (name, agentOpt) => {
+      const agent = agentOpt || makeAgentIdentity();
+      const ws = await new Promise((res, rej) => {
+        const w = new WebSocket(url);
+        w.on('open', () => res(w));
+        w.on('error', rej);
+      });
+      /* Parse on receipt, and keep a cache. next() looks in the cache first and
+         only then subscribes, so a handler that stores raw strings loses the
+         race against a fast local server and times out on a message it
+         already received. open() above has the same shape for this reason. */
+      ws.msgs = [];
+      ws.closed = null;
+      ws.on('message', (d) => ws.msgs.push(JSON.parse(String(d))));
+      ws.on('close', (code, reason) => { ws.closed = { code, reason: String(reason) }; });
+      ws.send(JSON.stringify({ type: 'register', name, secret: agent.secretB64, proto: 3 }));
+      const ch = await next(ws, 'challenge');
+      ws.send(JSON.stringify({
+        type: 'auth',
+        proof: identity.clientProof(agent.secret, Buffer.from(ch.nonce, 'base64')).toString('base64'),
+      }));
+      return { ws, agent, reg: await next(ws, 'registered') };
+    };
+
+    const a = await enrol('cap-a');
+    const b = await enrol('cap-b');
+    assert.equal(a.reg.error, undefined, `the first enrols: ${JSON.stringify(a.reg)}`);
+    assert.equal(b.reg.error, undefined, `the second enrols: ${JSON.stringify(b.reg)}`);
+
+    const c = await enrol('cap-c');
+    assert.match(String(c.reg.error), /roster is full/,
+      `a capped roster must say so, got: ${JSON.stringify(c.reg)}`);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.ok(c.ws.closed, 'socket should close');
+
+    /* A box already on the roster may still re-link. Refusing a reconnect
+       because the registry is full would punish an ordinary link drop for the
+       state of the registry, and nothing grows. Reuse the *original* secret
+       here — a fresh identity would be a third new implant, and refusing it is
+       exactly what the cap is for. */
+    const again = await enrol('cap-a', a.agent);
+    assert.equal(again.reg.error, undefined,
+      `a returning implant is exempt from the cap: ${JSON.stringify(again.reg)}`);
+    assert.equal(again.reg.id, a.reg.id, 'and it keeps the same id');
+
+    for (const w of [a.ws, b.ws, c.ws, again.ws]) w.close();
+  } finally {
+    cap.kill();
+    for (const f of [db, `${db}-wal`, `${db}-shm`]) { try { fs.unlinkSync(f); } catch {} }
+  }
 });
 
 test('a malformed secret is rejected before any auth work', async () => {
   for (const bad of ['', 'AAAA', 'not-base64!!', Buffer.alloc(64).toString('base64')]) {
     const ws = await open();
-    ws.send(JSON.stringify({ type: 'register', name: 'x', secret: bad, setupKey: SETUP_KEY }));
+    ws.send(JSON.stringify({ type: 'register', name: 'x', secret: bad }));
     const reg = await next(ws, 'registered');
     assert.match(reg.error, /secret/, `accepted a malformed secret: ${bad}`);
     closeAll(ws);

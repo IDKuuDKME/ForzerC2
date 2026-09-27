@@ -25,7 +25,7 @@ function waitFor(fn, ms, label) {
 
 (async () => {
   const server = spawn(process.execPath, [path.join(ROOT, 'server', 'server.js')], {
-    env: { ...process.env, PORT: String(PORT), FORZER_DB: DB, DASH_USER: 'u', DASH_PASS: 'p', SETUP_KEY: 'k'.repeat(32),
+    env: { ...process.env, PORT: String(PORT), FORZER_DB: DB, DASH_USER: 'u', DASH_PASS: 'p',
            /* One deliberate bad password below, against a real per-address
              counter. Raised here so the policy checks cannot lock 127.0.0.1
              out from under themselves; test/throttle.test.js owns the
@@ -63,7 +63,7 @@ function waitFor(fn, ms, label) {
     //    CLI itself. This is the frame path that had to change (ev.data).
     const implant = spawn(process.execPath, ['_fake-implant.js', `ws://127.0.0.1:${PORT}`], {
       cwd: __dirname,
-      env: { ...process.env, SETUP_KEY: 'k'.repeat(32) },
+      env: { ...process.env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     const implantLog = [];

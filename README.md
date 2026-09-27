@@ -15,7 +15,7 @@ A small peer-to-peer mesh control toolkit with three cooperating parts:
 |---|---|---|
 | Runs on | the machine being **managed** | **your** machine |
 | Registers as | a *device/peer* in the mesh | a *viewer* on the dashboard |
-| Authenticates with | `setupKey` | dashboard `user`/`pass` |
+| Authenticates with | its own 32-byte key (DPAPI-pinned) | dashboard `user`/`pass` |
 | Role | **receives** and executes commands | **originates** commands |
 | Can it be commanded? | yes — that is its job | no, ever |
 
@@ -29,7 +29,7 @@ without the user profile). Check-in is a two-step exchange:
 
 ```
 implant                                   control plane
-   |-- register {name, secret, setupKey} -->|   setup key checked (constant-time)
+   |-- register {name, secret} --------->|   roster cap checked
    |<--------------- challenge {nonce} ----|
    |-- auth {HMAC(secret, "forzer/client/v1" || nonce)} -->|   verified
    |<-- registered {id, serverProof, firstSeen, lastSeen} --|
@@ -43,9 +43,10 @@ round trip:
   `sha256("forzer/implant-id/v1" || secret)[:16]`, so the control plane's registry
   pins it permanently. The previous design minted a fresh random `id` on every
   connection, so a rebooted box rejoined as an unfamiliar device.
-- **`SETUP_KEY` is a join secret, not a credential.** It gets a box onto the
-  mesh once. After that, possession of the shared secret is what identifies it,
-  so leaking the setup key does not let anyone take over an existing implant.
+- **There is no join secret.** Enrolment is open and the roster is capped
+  instead (`FORZER_MAX_IMPLANTS`). There used to be a `SETUP_KEY` every box had
+  to present on first contact; it gated almost nothing, cost a great deal, and
+  is gone. The reasoning is in [No enrolment secret](#no-enrolment-secret).
 - **The control plane is authenticated too.** The server proves possession of the
   same secret under a *different* label — a client proof is not a valid server
   proof, so the exchange cannot be reflected. The secret *is* the pin: there is
@@ -151,7 +152,7 @@ suite with a rebuild message instead of quietly stepping aside.
 
 There is no peer-to-peer command path. Every command travels
 **operator → control plane → implant**, which makes the dashboard credential the
-trust boundary. `SETUP_KEY` is only a join secret (see above).
+trust boundary, and it is the *only* credential in the system.
 
 The server enforces this by splitting the message types in two — both sets
 derived from the catalog described above:
@@ -280,7 +281,7 @@ asymmetric-to-PSK move described above.
 ### Agent (Windows, MinGW / MSVC cl)
 ```bash
 cd agent
-FORZER_SERVER=ws://127.0.0.1:3000 FORZER_SETUP_KEY=changeme Forzer.exe
+FORZER_SERVER=ws://127.0.0.1:3000 Forzer.exe
 ```
 
 Build **quiet, windowless** (what you want for a persistent install):
@@ -473,7 +474,6 @@ passes. The exit status is the signal there.
 | Variable | Component | Meaning |
 |----------|-----------|---------|
 | `PORT` | server | listen port (default `3000`) |
-| `SETUP_KEY` | server | shared secret a peer must present to register |
 | `DASH_USER` / `DASH_PASS` | server | dashboard login |
 | `DASH_ALLOWED_ORIGINS` | server | comma-separated extra `Origin` values to accept for the dashboard WebSocket (same-origin is always allowed; the C agent sends no `Origin` and is unaffected) |
 | `FORZER_AUTH_MAX_FAILURES` | server | failed auths from one address inside the window before it is locked out (default 8) |
@@ -481,8 +481,8 @@ passes. The exit status is the signal there.
 | `FORZER_AUTH_BLOCK_MS` | server | how long a locked-out address stays locked out (default 900000) |
 | `FORZER_AUTH_DEADLINE_MS` | server | how long a socket may stay connected without authenticating before it is closed (default 30000) |
 | `FORZER_MAX_UNAUTH_PER_IP` | server | concurrent *unauthenticated* sockets allowed from one address (default 16) |
+| `FORZER_MAX_IMPLANTS` | server | ceiling on the roster, since enrolment itself is open (default 256) |
 | `FORZER_SERVER` | agent | `ws://` or `wss://` control-plane URL (overrides the config file) |
-| `FORZER_SETUP_KEY` | agent | must match the server's `SETUP_KEY` (overrides the config file) |
 | `FORZER_NAME` | agent | device name to register as (defaults to the computer name) |
 | `FORZER_ALLOW_REMOTE` | agent | set to `0` to refuse remote commands and terminal sessions |
 | `FORZER_EXEC_TIMEOUT_MS` | agent | ms before a running command is killed and reported as `rc=124` (0–86400000, default 300000; 0 = no limit) |
@@ -501,7 +501,7 @@ picked the secret rather than of the server.
 
 | | Default | What it stops |
 |---|---|---|
-| `FORZER_AUTH_MAX_FAILURES` | 8 | wrong `SETUP_KEY` or `DASH_PASS` from one address in the window |
+| `FORZER_AUTH_MAX_FAILURES` | 8 | wrong `DASH_PASS` from one address in the window |
 | `FORZER_AUTH_WINDOW_MS` | 10 min | …counted within this sliding window |
 | `FORZER_AUTH_BLOCK_MS` | 15 min | the address is then refused *before* any credential is compared |
 | `FORZER_AUTH_DEADLINE_MS` | 30 s | a socket that connects and never authenticates |
@@ -531,23 +531,103 @@ socket cap is the half that does not depend on the address being true. The
 successful-login reset is the other half — it bounds how much a single address
 can cost regardless of what it claims.
 
+## No enrolment secret
+
+There used to be a `SETUP_KEY`: every implant had to present it on its first
+`register`, on the theory that it gated who could join the fleet. It gated
+almost nothing and cost a great deal, so it is gone. What it actually bought:
+
+- **Not command authority.** A holder could add a row to the roster and nothing
+  else. The dashboard password was, and still is, the trust boundary.
+- **Not impersonation either — that was already covered.** `forzerctl` refuses
+  an ambiguous name match (`"DELL24-SEC-036" matches 2 implants — use the id
+  instead`), so a squatter registering your box's hostname makes your typed
+  command *fail* rather than reach them. The attack denies a convenience; it
+  does not become your box.
+- **It made every implant a place the control plane's credential lived.** The
+  key sat in `%APPDATA%\Forzer\config.json` on every install, so compromising
+  any one implant compromised the join capability of the whole fleet. Removing it
+  means an implant holds no server credential at all — only its own key, which
+  identifies nothing but itself.
+- **And it was the secret nobody could find.** An operator who cannot retrieve
+  the join key cannot enrol their own box, which is precisely the failure a join
+  secret exists to prevent. That happened, on this project, before the argument
+  was finished.
+
+What replaces it is a cap. Enrolment is open, so `FORZER_MAX_IMPLANTS` (default
+256) bounds an unauthenticated write — it stops a spray from growing the table
+without limit and makes a flood visible in the logs as a refusal. A box already
+on the roster is exempt, because refusing a reconnect over the state of the
+registry would punish an ordinary link drop for someone else's action.
+
+The dashboard password is now the only credential in the system. One thing to
+set, one thing to rotate, and nothing to distribute.
+
+## Pinned public key
+
+The agent could not validate a real HTTPS server at all. `CertGetCertificateChain()`
+builds a chain from the trusted store plus whatever the caller passes in
+`pAdditionalStore`, and by default ignores the intermediates that arrived in the
+TLS handshake — and a real server's leaf is issued by an *intermediate*, not a
+root. So the chain came back with one element and every `wss://` connection died
+with `CERT_E_UNTRUSTEDROOT`. It never showed up because every test target was
+`ws://` on loopback; the first real `wss://` target was a public host behind a
+CDN, and the agent simply could not reach it.
+
+The certificate was never the problem. Fetching the same URL with the same root
+store returned 200, and a deliberate chain build with the system store and an
+empty extra store reproduced it exactly: `PartialChain`, `elements=1`.
+
+So the agent now trusts the endpoint two independent ways and accepts either:
+
+| | |
+|---|---|
+| **Pin** | the leaf's public key is one this build was built with. A commitment to a specific key that a CA mis-issuance cannot produce and a man-in-the-middle cannot forge. |
+| **Chain** | the original `CertGetCertificateChain()` + `CERT_CHAIN_POLICY_SSL` check, kept intact — still the right check for any endpoint whose issuer is a root, and every `ws://` development target. |
+
+The hostname is checked in both paths, before either can forgive anything, and
+by walking *every* `dNSName` in the subjectAltName rather than the first. That
+detail is not academic: the live endpoint presents `DNS:onrender.com,
+DNS:*.onrender.com`, so a single-name comparison misses `forzerc2.onrender.com`
+while the wildcard two entries later is the name that covers it. The subject CN
+is consulted only when there is no SAN at all — that fallback is the whole
+family of name-confusion bugs.
+
+For an implant that talks to exactly one endpoint, pinning is the better trust
+model, not a workaround: the anchor is "this control plane's key" instead of
+"anything a public CA has issued", and the implant stops depending on the host's
+root store.
+
+**The pin is a build-time pin.** Regenerate the table with `urlenc.exe`, which
+takes one or more hashes and accepts any match, so a rotation can roll out
+alongside the old key instead of bricking installs:
+
+```
+urlenc.exe wss://your.host <sha256-of-key> [<sha256-of-key> ...]
+```
+
+When the server's key rotates, a long-lived install needs a new build. The
+natural fix is to carry the pin table in the `update` op, which already moves a
+digest over the authenticated channel; that is not implemented, and until it is,
+rotation means a rebuild.
+
 ## Security note
 
-This is an early-stage research/MVP build. The default setup key and dashboard
-credentials are placeholders — **override them via environment variables before
-exposing anything to a network.** The server logs a warning at startup whenever
-the placeholders are still in effect. Implant state is persisted (see
+This is an early-stage research/MVP build. The default dashboard credentials
+are placeholders — **override them via environment variables before exposing
+anything to a network.** The server logs a warning at startup whenever the
+placeholders are still in effect. That password is now the only credential in
+the system: there is no second secret to manage, and an implant holds none. Implant state is persisted (see
 [Persistence](#persistence--what-exists)); the dashboard viewer sessions and the
 live socket table are in memory, which is correct — a browser session is not
 something to restore across a redeploy.
 
 The agent validates the server certificate chain and hostname on every `wss://` connection, and
 refuses to self-update without a pinned SHA-256. It does **not** pin a Schannel root store, so it
-trusts whatever roots the host has installed. `SETUP_KEY` is a *join* secret, not a command
-authority — a device that presents it can only be commanded by the control plane, never by another
-device (see [Commands are server-authoritative](#commands-are-server-authoritative)). The
-dashboard credentials are the actual trust boundary, and both it and `SETUP_KEY` are guessable at
-the wire, so the control plane rate-limits both:
+trusts whatever roots the host has installed. It also carries a **pinned public key**
+for the built-in endpoint, so an unbuildable chain does not stop it — see
+[Pinned public key](#pinned-public-key). The dashboard password is the actual trust
+boundary, and it is guessable at the wire, so the control plane rate-limits it:
 
 ---
 
@@ -561,15 +641,16 @@ directory holding the binary when there is no user profile:
 ```json
 {
   "url": "ws://127.0.0.1:3000",
-  "setupKey": "your-shared-secret",
   "name": "WIN-DESKTOP-01"
 }
 ```
 
+**There is no key in it.** An implant holds no server credential at all — only
+its own identity, which proves it is itself and means nothing to anyone else.
+
 Precedence is **environment > config file > built-in default**, so a single launch can still
-be overridden by hand. `--config` prints the resolved settings (the key is never echoed) and
-exits non-zero if the key is still the placeholder — useful for answering "why is this talking
-to the wrong server".
+be overridden by hand. `--config` prints the resolved settings and exits non-zero if no
+endpoint could be resolved — useful for answering "why is this talking to the wrong server".
 
 **The built-in default endpoint is obfuscated in the binary.** It used to sit in the clear as
 `#define DEFAULT_SERVER "wss://forzerc2.onrender.com"`, which is one `strings` away and a
@@ -613,15 +694,14 @@ tree.
 `--uninstall` removes only the task. It intentionally leaves the binary and config in place,
 so a mistaken uninstall is reversible and stop-the-persistence is one reversible step.
 
-It **refuses to install with the placeholder key `changeme`**, because a task-launched process
+It **refuses to install when no endpoint can be resolved**, because a task-launched process
 inherits no environment and would otherwise come up silently attached to the public default
-server with a publicly known setup key. Pass `--allow-placeholder-key` to override that for
-local testing.
+server with no operator in the loop.
 
-The setup key is a secret on disk. `%APPDATA%` is per-user and inherits a restrictive ACL from
-the profile, so the file is readable by that user and by administrators — do not sync it or
-commit it. The config is written to a temp file and renamed, so an interrupted write cannot
-leave a truncated file behind.
+`config.json` is not a secret — it holds a URL and a name. The only private material in the
+process is `identity.key`, DPAPI-sealed to the user and therefore useless anywhere but this
+host and this profile. The config is written to a temp file and renamed, so an interrupted
+write cannot leave a truncated file behind.
 
 Mechanisms that were considered and not implemented, if you need them: a real Windows service
 would start at boot with no interactive session, which the logon task does not. A service also

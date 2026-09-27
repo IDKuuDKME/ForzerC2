@@ -14,9 +14,13 @@
 #   - run the control plane somewhere with a persistent filesystem
 # Until then, treat the identity work as local/dev-only.
 #
-# DASH_USER and DASH_PASS are declared below with sync: false, so Render will
-# refuse to deploy until you set them. They were previously absent entirely,
-# which silently ran the dashboard on placeholders published in this repository.
+# There is no enrolment secret. A box enrols on its own pinned key alone, so
+# the only credential in the system is DASH_PASS below — one thing to set, one
+# thing to rotate, and nothing to distribute to every implant.
+#
+# DASH_USER and DASH_PASS are declared with sync: false, so Render will refuse
+# to deploy until you set them. They were previously absent entirely, which
+# silently ran the dashboard on placeholders published in this repository.
 #
 # NODE_VERSION is pinned deliberately. The control plane stores its implant
 # registry with node:sqlite, which is still flagged experimental in 22.x, and
@@ -35,9 +39,6 @@ services:
         value: 22.16.0
       - key: PORT
         value: 3000
-      - key: SETUP_KEY
-        sync: false
-        generateValue: true
       - key: DASH_USER
         sync: false
       - key: DASH_PASS
@@ -45,3 +46,7 @@ services:
       # Uncomment once a persistent disk is attached.
       # - key: FORZER_DB
       #   value: /opt/render/project/src/server/data/forzer.db
+      # Roster cap. Enrolment is open (no join secret), so this is what stops
+      # an unauthenticated caller from growing the table without bound.
+      # - key: FORZER_MAX_IMPLANTS
+      #   value: 256
