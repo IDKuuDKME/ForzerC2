@@ -130,6 +130,24 @@
      flex: 1; overflow: hidden;
    }
    #term-container .xterm { height: 100%; }
+   /* One-shot command bar: uses the non-interactive command path, which does
+      not need a working ConPTY. When the interactive shell is mute, this is
+      how commands still get through. */
+   .cmd-bar {
+     display: flex; gap: 8px; padding: 8px 12px;
+     border-top: 1px solid var(--border); background: var(--panel);
+   }
+   .cmd-bar input {
+     flex: 1; background: var(--panel-2); border: 1px solid var(--border);
+     color: var(--text); border-radius: 8px; padding: 7px 10px;
+     font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px;
+   }
+   .cmd-bar input:disabled { opacity: 0.5; }
+   .cmd-bar button {
+     background: var(--accent); border: none; color: #fff; border-radius: 8px;
+     padding: 7px 14px; cursor: pointer; font-size: 13px;
+   }
+   .cmd-bar button:disabled { opacity: 0.5; cursor: default; }
    /* Command mode styles */
    .cmd { color: var(--accent); }
    .cmd:before { content: "$ "; color: var(--muted); }
@@ -276,6 +294,10 @@
           </div>
         </div>
         <div id="term-container" style="flex:1;overflow:hidden;"></div>
+        <div class="cmd-bar">
+          <input id="cmd-input" type="text" placeholder="Run a command (Enter) — uses the exec path, not the shell" autocomplete="off" spellcheck="false" />
+          <button id="cmd-run">Run</button>
+        </div>
       </div>
 
 
@@ -448,6 +470,7 @@
   /* --------------------------- Live terminal --------------------------- */
   var termActive = false;
   var termId = null;
+  var cmdPending = null; /* id of the one-shot command awaiting a result */
   var xterm = null;
   var fitAddon = null;
   var termContainer = document.getElementById('term-container');
@@ -550,6 +573,38 @@
     termId = null;
   }
 
+  function cmdRun() {
+    var input = document.getElementById('cmd-input');
+    var btn = document.getElementById('cmd-run');
+    var cmd = input.value.trim();
+    if (!cmd || cmdPending || !ws || ws.readyState !== 1 || !activePeerId) return;
+    cmdPending = 'c-' + Date.now().toString(36);
+    input.disabled = true; btn.disabled = true;
+    cmdEcho('$ ' + cmd);
+    ws.send(JSON.stringify({ type: 'command', to: activePeerId, id: cmdPending, data: cmd }));
+    input.value = '';
+  }
+
+  /* Show command text and results in the terminal when it is open, otherwise
+     in the event log — either way the operator sees what ran and what came
+     back. */
+  function cmdEcho(text) {
+    if (xterm) xterm.write('\r\n\x1b[36m' + text.replace(/\n/g, '\r\n') + '\x1b[0m\r\n');
+    else log(text);
+  }
+  function cmdDone() {
+    cmdPending = null;
+    var input = document.getElementById('cmd-input');
+    var btn = document.getElementById('cmd-run');
+    input.disabled = false; btn.disabled = false;
+    input.focus();
+  }
+
+  document.getElementById('cmd-run').addEventListener('click', cmdRun);
+  document.getElementById('cmd-input').addEventListener('keydown', function (ev) {
+    if (ev.key === 'Enter') cmdRun();
+  });
+
   document.getElementById('console-close').addEventListener('click', function () {
     if (termActive) termStop();
     activePeerId = null;
@@ -648,6 +703,19 @@
           }
         } else if (msg.type === 'term-end') {
           if (msg.id === termId && xterm) xterm.write('\r\n\x1b[33m--- session closed ---\x1b[0m\r\n');
+        } else if (msg.type === 'command-result') {
+          if (msg.id === cmdPending) {
+            var out = msg.data ? String(msg.data) : '(no output)';
+            if (xterm) xterm.write(out.replace(/\n/g, '\r\n') + '\r\n\x1b[33m[rc=' + msg.rc + ']\x1b[0m\r\n');
+            else log('command result [rc=' + msg.rc + '] &middot; ' + escapeHtml(out.slice(0, 300)));
+            cmdDone();
+          }
+        } else if (msg.type === 'command-error') {
+          if (msg.id === cmdPending) {
+            if (xterm) xterm.write('\r\n\x1b[31mcommand failed: ' + String(msg.error || 'unknown') + '\x1b[0m\r\n');
+            else log('command failed &middot; ' + escapeHtml(String(msg.error || 'unknown')));
+            cmdDone();
+          }
         } else if (msg.type === 'cancel-result') {
           if (msg.id === cancelPending) {
             cancelPending = null;

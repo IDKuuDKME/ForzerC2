@@ -2667,7 +2667,19 @@ static int term_drain(void) {
         term_stop();
         return 0;
     }
-    /* Detect child process exit and auto-restart */
+    /* Detect child process exit and auto-restart.
+       conhost holds the ConPTY pipes open after cmd.exe dies, so a dead shell
+       does NOT break the reader's ReadFile — without watching the process
+       itself the session sits mute forever: no output, no respawn, no error.
+       That is exactly the zombie the operator saw as an empty terminal. */
+    if (g_term.inited && g_term.active && !g_term.reader_exited &&
+        g_term.hProcess != INVALID_HANDLE_VALUE &&
+        WaitForSingleObject(g_term.hProcess, 0) == WAIT_OBJECT_0) {
+        DWORD rc = 0;
+        GetExitCodeProcess(g_term.hProcess, &rc);
+        DBG("[term] shell process exited (rc=%lu) with the ConPTY still open — treating as session end\n", rc);
+        g_term.reader_exited = 1;
+    }
     if (g_term.inited && g_term.active && g_term.reader_exited) {
         /* Clean up the dead ConPTY and restart */
         /* Zero-initialised: g_term.id is a 64-byte field, so strncpy of
@@ -2774,6 +2786,29 @@ static int run_interactive(const char *to, const char *id) {
         if (hPTYOutWrite != INVALID_HANDLE_VALUE) CloseHandle(hPTYOutWrite);
         term_stop_quiet(); /* also clears `inited`, so term_drain bails out */
         return -1;
+    }
+
+    /* A ConPTY child only attaches to its pseudoconsole when the *parent*
+       has a console. Without one, CreateProcess succeeds but cmd.exe bypasses
+       the pseudoconsole entirely: its prompt lands on the parent's std
+       handles, its stdin is EOF, and it exits 0 within milliseconds — every
+       time, forever. Proven by launching the agent with and without a console
+       against a local control plane: consoled, the full banner streams
+       through the pipe and input echoes; console-less, zero shell bytes and
+       an instant clean exit. So ensure a console exists before building the
+       ConPTY, lazily — only when a terminal is actually opened, never at
+       startup — and hide it at once. A hidden console costs nothing; a
+       missing one costs the whole terminal. It is deliberately never freed:
+       one hidden console for the process lifetime beats a flash on every
+       session. */
+    if (!GetConsoleWindow()) {
+        if (AllocConsole()) {
+            HWND hwnd = GetConsoleWindow();
+            if (hwnd) ShowWindow(hwnd, SW_HIDE);
+            DBG("[term] allocated a hidden console so the ConPTY child attaches\n");
+        } else {
+            DBG("[term] AllocConsole failed (%lu) — the shell may not attach\n", GetLastError());
+        }
     }
 
     /* Create the pseudo console */
