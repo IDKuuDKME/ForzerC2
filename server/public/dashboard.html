@@ -563,10 +563,33 @@
 
   var ws = null;
   var reconnectTimer = null;
-  var creds = null; // set after successful login
+  var creds = null;   // confirmed by the server — these are real
+  var pending = null; // typed, but not yet accepted by anyone
+  var attempt = 0;    // consecutive failed connects; drives the backoff
+
+  /* Bounded, jittered backoff.
+
+     A fixed interval is the wrong shape twice over. Every open dashboard would
+     retry on the same 3s tick, so one server restart becomes a synchronised
+     stampede. And an operator who mistypes the password would retry forever,
+     which the server's auth throttle answers by blocking their own address —
+     after which the *correct* password fails too. A retry loop must never be
+     able to do that, so the credentials are dropped on the first refusal and
+     only a dropped link earns another attempt. */
+  var RECONNECT_MAX_MS = 30000;
+
+  function scheduleReconnect(reason) {
+    if (reconnectTimer) return;
+    attempt++;
+    var base = Math.min(RECONNECT_MAX_MS, 1000 * Math.pow(2, attempt - 1));
+    var wait = base * (0.5 + Math.random() * 0.5);   // 50-100% of base
+    log(reason + ' &middot; retrying in ' + Math.max(1, Math.round(wait / 1000)) + 's');
+    reconnectTimer = setTimeout(function () { reconnectTimer = null; connect(); }, wait);
+  }
 
   function connect() {
-    if (!creds) return; // must be logged in first
+    var auth = pending || creds;
+    if (!auth) return; // must be logged in first
     var proto = location.protocol === 'https:' ? 'wss' : 'ws';
     var url = proto + '://' + location.host + '/';
     setConn('connecting', 'connecting…');
@@ -574,15 +597,33 @@
     ws = new WebSocket(url);
 
     ws.onopen = function () {
-      setConn('live', 'live');
-      ws.send(JSON.stringify({ type: 'dashboard', user: creds.user, pass: creds.pass }));
-      log('<b>connected</b> &middot; subscribed as dashboard viewer');
+      /* Not "live" yet. An open socket says nothing about whether these
+         credentials are any good — that answer arrives as dashboard-ready. */
+      setConn('connecting', 'authenticating…');
+      ws.send(JSON.stringify({ type: 'dashboard', user: auth.user, pass: auth.pass }));
     };
 
     ws.onmessage = function (ev) {
       try {
         var msg = JSON.parse(ev.data);
+        if (msg.type === 'dashboard-ready') {
+          /* The server accepted these credentials. Only now do they count. */
+          creds = pending || creds;
+          pending = null;
+          attempt = 0;
+          setConn('live', 'live');
+          log('<b>authenticated</b> &middot; subscribed as dashboard viewer');
+          return;
+        }
         if (msg.type === 'dashboard-auth' && !msg.ok) {
+          /* Drop the credentials on the first refusal. Leaving them in place is
+             what turned a typo into a permanent 3s retry loop, and the server's
+             throttle turned that loop into a 15-minute lockout of whoever typed
+             it wrong. One refusal, one stop. */
+          creds = null;
+          pending = null;
+          attempt = 0;
+          if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
           setConn('down', 'auth failed');
           document.getElementById('login-err').textContent = msg.error || 'login failed';
           showLogin();
@@ -618,12 +659,19 @@
       } catch (e) { /* ignore */ }
     };
 
-    ws.onclose = function () {
+    ws.onclose = function (ev) {
       setConn('down', 'disconnected');
-      log('connection closed &middot; retrying in 3s');
-      if (!reconnectTimer) {
-        reconnectTimer = setTimeout(function () { reconnectTimer = null; connect(); }, 3000);
+      if (!creds && !pending) return;   // logged out, or auth just failed
+      /* 1008 is a policy refusal, not a dropped link. Retrying it only spends
+         the operator's remaining attempts against the auth throttle. */
+      if (ev && ev.code === 1008) {
+        pending = null;
+        setConn('down', 'refused');
+        loginErr.textContent = 'the control plane refused this session — sign in again';
+        showLogin();
+        return;
       }
+      scheduleReconnect('connection closed');
     };
 
     ws.onerror = function () {
@@ -653,7 +701,10 @@
     var p = loginPass.value;
     loginErr.textContent = '';
     if (!u || !p) { loginErr.textContent = 'enter username and password'; return; }
-    creds = { user: u, pass: p };
+    /* Staged, not committed: the server has to answer dashboard-ready before
+       these are treated as credentials at all. */
+    pending = { user: u, pass: p };
+    attempt = 0;
     hideLogin();
     connect();
   }
@@ -664,6 +715,8 @@
 
   logoutBtn.addEventListener('click', function () {
     creds = null;
+    pending = null;
+    attempt = 0;
     if (ws) { try { ws.close(); } catch (e) {} }
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     showLogin();
