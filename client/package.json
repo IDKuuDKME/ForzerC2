@@ -1,0 +1,16 @@
+{
+  "name": "forzerctl",
+  "version": "0.1.0",
+  "description": "forzerctl - command-line client for the Forzer control plane (implant list, commands, interactive terminals). No dependencies.",
+  "main": "forzerctl.js",
+  "bin": {
+    "forzerctl": "forzerctl.js"
+  },
+  "scripts": {
+    "start": "node forzerctl.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}

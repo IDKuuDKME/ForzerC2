@@ -1,13 +1,14 @@
 {
   "name": "forzer-server",
   "version": "0.1.0",
-  "description": "Forzer control plane - coordinates WireGuard mesh peers",
+  "description": "Forzer control plane - authenticates implants and issues commands to them",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test \"test/*.test.js\" && node test/e2e-cli.test.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "dependencies": {
     "ws": "^8.18.0"

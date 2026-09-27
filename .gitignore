@@ -7,6 +7,8 @@ node_modules/
 *_test*.exe
 *_dbg.exe
 pipecheck.exe
+# Written by server/test/ops.test.js when it runs the real agent binary.
+agent/ops-check-*.json
 
 # ---- Agent binary (source-built, commit the release binary only) ----
 agent/*.exe
@@ -28,3 +30,10 @@ agent_out.log
 .vscode/
 .idea/
 *.swp
+
+# ---- Control-plane state ----
+server/data/
+data/
+*.db
+*.db-wal
+*.db-shm

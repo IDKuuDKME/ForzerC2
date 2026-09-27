@@ -1,16 +1,13 @@
 {
   "name": "forzer-mcp",
   "version": "0.1.0",
-  "description": "Forzer MCP server - drives the control plane (peers, commands, terminal) over stdio JSON-RPC",
+  "description": "Forzer MCP server - drives the control plane (implants, commands, terminal) over stdio JSON-RPC. No dependencies.",
   "main": "mcp-server.js",
   "scripts": {
     "start": "node mcp-server.js"
   },
   "engines": {
-    "node": ">=18"
-  },
-  "dependencies": {
-    "ws": "^8.18.0"
+    "node": ">=22"
   },
   "license": "MIT"
 }

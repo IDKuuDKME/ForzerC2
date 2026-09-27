@@ -1,0 +1,129 @@
+{
+  "_comment": [
+    "The op catalog: one source of truth for what an implant can be asked to do.",
+    "",
+    "server/ops.js reads this at startup. It is the catalog clients offer and the",
+    "contract the server validates against. The agent keeps its own table of what",
+    "it actually implements and advertises those names during the handshake, so a",
+    "new op on the agent shows up without touching the server, and an op the",
+    "server offers that the agent lacks is refused at request time with a real",
+    "error rather than the silent catch-all ignore.",
+    "",
+    "`type` is the wire verb and is what the agent dispatches on. It is the join",
+    "key between this catalog and the C table, which is why the two have to agree:",
+    "server/test/ops.test.js runs the REAL agent and fails if the advertised set",
+    "and the executable set here ever drift apart.",
+    "",
+    "cap is the capability name. A viewer must hold the cap to originate the op.",
+    "It is checked twice, independently: the server refuses to relay, and the",
+    "agent re-checks on arrival. A compromised control plane still cannot talk an",
+    "implant into running something its operator was never granted.",
+    "",
+    "`alsoReply` marks the one legitimate case of a wire type appearing in both",
+    "the request and the reply direction: `term-end` is a viewer's 'close this",
+    "session' and, from the other side, the implant's 'closed'. The dispatcher",
+    "resolves this by origin, not by type - an implant socket is checked against",
+    "IMPLANT_ROUTABLE first - so the overlap is unambiguous. Declaring it keeps",
+    "the loader's uniqueness check meaningful instead of having to be switched",
+    "off, which is what an undocumented exception always turns into."
+  ],
+
+  "protocol": 3,
+
+  "capabilities": {
+    "exec": "run a command line and read its output",
+    "shell": "open an interactive pseudo-terminal",
+    "control": "liveness control - tell a peer to go quiet",
+    "update": "replace the agent binary on a peer"
+  },
+
+  "ops": [
+    {
+      "type": "command",
+      "name": "exec",
+      "cap": "exec",
+      "args": "string",
+      "field": "data",
+      "maxArg": 8192,
+      "result": "command-result",
+      "desc": "Run a command line; returns stdout, stderr and the exit code",
+      "executable": true
+    },
+    {
+      "type": "term-start",
+      "name": "shell.open",
+      "cap": "shell",
+      "args": "none",
+      "field": null,
+      "maxArg": 0,
+      "result": "term-data",
+      "desc": "Open an interactive pseudo-terminal on the peer",
+      "executable": true
+    },
+    {
+      "type": "term-input",
+      "name": "shell.input",
+      "cap": "shell",
+      "args": "string",
+      "field": "data",
+      "maxArg": 8192,
+      "result": "term-data",
+      "desc": "Send keystrokes to an open shell session",
+      "executable": true
+    },
+    {
+      "type": "term-end",
+      "name": "shell.close",
+      "cap": "shell",
+      "args": "none",
+      "field": null,
+      "maxArg": 0,
+      "result": "term-exit",
+      "desc": "Close a shell session",
+      "executable": true,
+      "alsoReply": true
+    },
+    {
+      "type": "cancel",
+      "name": "cancel",
+      "cap": "control",
+      "args": "none",
+      "field": null,
+      "maxArg": 0,
+      "result": "cancel-result",
+      "desc": "Terminate the command currently running on the peer; rc=0 if there was one, rc=1 if the peer was idle. Terminal sessions are not affected - use shell.close",
+      "executable": true
+    },
+    {
+      "type": "sleep",
+      "name": "sleep",
+      "cap": "control",
+      "args": "number",
+      "field": "ms",
+      "maxArg": 0,
+      "result": "none",
+      "desc": "Tell the peer to drop the link and stay off the network for a while",
+      "executable": true
+    },
+    {
+      "type": "update",
+      "name": "update",
+      "cap": "update",
+      "args": "string",
+      "field": "path",
+      "maxArg": 1024,
+      "result": "command-result",
+      "desc": "Push a new agent binary; the peer verifies the digest and installs. With restart=1 it relaunches now; default restart=0 applies the new image at the next agent start",
+      "executable": true,
+      "control_plane_only": true
+    }
+  ],
+
+  "implantOriginated": [
+    { "type": "command-result", "answers": "command", "desc": "output and exit code from an exec" },
+    { "type": "cancel-result", "answers": "cancel", "desc": "whether there was anything running to cancel" },
+    { "type": "term-data", "answers": "term-start", "desc": "bytes from a pseudo-terminal" },
+    { "type": "term-exit", "answers": "term-start", "desc": "the shell exited on its own" },
+    { "type": "term-end", "answers": "term-end", "desc": "the session was closed by request" }
+  ]
+}
